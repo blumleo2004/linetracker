@@ -25,11 +25,13 @@ static uint16_t AMBER_DIM;   // dim amber for separators/glow
 static const char* CONFIG_PATH = "/config.json";
 static const char* WIFI_RESET_FLAG = "/wifi_reset";
 
-static int cfgRotateSec    = 5;    // page switch interval in seconds (default 5)
-static int cfgBrightness   = 255;  // backlight 0-255 (default max)
-static int cfgNightFrom    = -1;   // night mode start hour (0-23), -1 = disabled
-static int cfgNightTo      = -1;   // night mode end hour (0-23)
-static int cfgNightBright  = 20;   // backlight during night mode
+static int  cfgRotateSec      = 5;     // page switch interval in seconds (default 5)
+static int  cfgBrightness     = 255;   // backlight 0-255 (default max)
+static int  cfgNightFrom      = -1;    // night mode start hour (0-23), -1 = disabled
+static int  cfgNightTo        = -1;    // night mode end hour (0-23)
+static int  cfgNightBright    = 20;    // backlight during night mode
+static bool cfgShowNext       = false; // show next departure below main countdown
+static bool cfgShowDisruptions= false; // show WL disruption ticker at bottom
 
 struct ConfigLine {
     String rbl;
@@ -86,11 +88,13 @@ bool loadConfig() {
             if (os.stationName.length() > 0) cfgOebb.push_back(os);
         }
     }
-    cfgRotateSec   = doc["rotate_sec"]   | 5;
-    cfgBrightness  = doc["brightness"]   | 255;
-    cfgNightFrom   = doc["night_from"]   | -1;
-    cfgNightTo     = doc["night_to"]     | -1;
-    cfgNightBright = doc["night_bright"] | 20;
+    cfgRotateSec       = doc["rotate_sec"]        | 5;
+    cfgBrightness      = doc["brightness"]        | 255;
+    cfgNightFrom       = doc["night_from"]        | -1;
+    cfgNightTo         = doc["night_to"]          | -1;
+    cfgNightBright     = doc["night_bright"]      | 20;
+    cfgShowNext        = doc["show_next"]         | false;
+    cfgShowDisruptions = doc["show_disruptions"]  | false;
     if (cfgRotateSec   < 2)   cfgRotateSec   = 2;
     if (cfgRotateSec   > 60)  cfgRotateSec   = 60;
     if (cfgBrightness  < 10)  cfgBrightness  = 10;
@@ -120,11 +124,13 @@ void saveConfig() {
         obj["line"]    = os.line;
         obj["towards"] = os.towards;
     }
-    doc["rotate_sec"]   = cfgRotateSec;
-    doc["brightness"]   = cfgBrightness;
-    doc["night_from"]   = cfgNightFrom;
-    doc["night_to"]     = cfgNightTo;
-    doc["night_bright"] = cfgNightBright;
+    doc["rotate_sec"]       = cfgRotateSec;
+    doc["brightness"]       = cfgBrightness;
+    doc["night_from"]       = cfgNightFrom;
+    doc["night_to"]         = cfgNightTo;
+    doc["night_bright"]     = cfgNightBright;
+    doc["show_next"]        = cfgShowNext;
+    doc["show_disruptions"] = cfgShowDisruptions;
     serializeJson(doc, f);
     f.close();
 }
@@ -140,6 +146,7 @@ struct Departure {
 
 static std::vector<Departure> departures;     // all departures (raw)
 static std::vector<Departure> displaySlots;   // one per line+direction (smart grouped)
+static std::vector<String>    disruptions;    // active WL disruption titles
 static SemaphoreHandle_t dataMutex;
 static const unsigned long FETCH_INTERVAL_MS = 20000;
 static bool fetchError = false;
@@ -427,7 +434,17 @@ void handleRoot() {
     html += "<label style='font-size:13px;color:#aaa'>Nacht-Helligkeit: <b style='color:#eee'>" + nightBrVal + "%</b></label>";
     html += "<input type='range' name='night_bright' min='0' max='100' value='" + nightBrVal + "' style='width:100%;margin:8px 0'>";
 
-    html += "<button type='submit' style='background:#555'>Speichern</button>";
+    // Extra features
+    html += "<div style='margin-top:12px;display:flex;flex-direction:column;gap:8px'>";
+    html += "<label style='font-size:13px;color:#aaa'><input type='checkbox' name='show_next' value='1'";
+    if (cfgShowNext) html += " checked";
+    html += " style='width:auto;margin-right:6px'>Naechste Abfahrt anzeigen <span style='color:#666'>(z.B. &gt;12 min)</span></label>";
+    html += "<label style='font-size:13px;color:#aaa'><input type='checkbox' name='show_disruptions' value='1'";
+    if (cfgShowDisruptions) html += " checked";
+    html += " style='width:auto;margin-right:6px'>Stoerungsticker anzeigen</label>";
+    html += "</div>";
+
+    html += "<button type='submit' style='background:#555;margin-top:12px'>Speichern</button>";
     html += "</form></div>";
 
     // WiFi settings
@@ -570,6 +587,7 @@ void handleRemove() {
 // Forward declarations
 std::vector<Departure> fetchOebbStation(const String& stationName, int nowMin);
 void applyNightMode();
+String sanitize(String s);
 extern bool lastNightState;
 
 // Search ÖBB for station name, returns canonical name or empty string
@@ -861,6 +879,9 @@ void handleSettings() {
         cfgNightFrom = -1;
         cfgNightTo   = -1;
     }
+    cfgShowNext        = server.hasArg("show_next");
+    cfgShowDisruptions = server.hasArg("show_disruptions");
+
     // Apply brightness immediately (night mode check will update if needed)
     lastNightState = !lastNightState;  // force re-check
     applyNightMode();
@@ -982,6 +1003,7 @@ void fetchDepartures() {
     filter["data"]["monitors"][0]["lines"][0]["type"] = true;
     filter["data"]["monitors"][0]["lines"][0]["realtimeSupported"] = true;
     filter["data"]["monitors"][0]["lines"][0]["departures"]["departure"][0]["departureTime"]["countdown"] = true;
+    filter["data"]["trafficInfos"][0]["title"] = true;
 
     JsonDocument doc;
     if (deserializeJson(doc, payload, DeserializationOption::Filter(filter),
@@ -1027,10 +1049,21 @@ void fetchDepartures() {
         }
     }
 
+    // Parse disruptions
+    std::vector<String> newDisruptions;
+    if (doc["data"]["trafficInfos"].is<JsonArray>()) {
+        for (JsonObject info : doc["data"]["trafficInfos"].as<JsonArray>()) {
+            String title = info["title"].as<String>();
+            title.trim();
+            if (title.length() > 0) newDisruptions.push_back(sanitize(title));
+        }
+    }
+
     xSemaphoreTake(dataMutex, portMAX_DELAY);
-    departures = newDeps;
+    departures   = newDeps;
     displaySlots = newSlots;
-    fetchError = false;
+    disruptions  = newDisruptions;
+    fetchError   = false;
     xSemaphoreGive(dataMutex);
 }
 
@@ -1189,6 +1222,7 @@ static const int CD_SZ   = 4;  // countdown: 4×7=28px visible
 // Scroll state per row
 static int scrollOffset[MAX_ROWS] = {0, 0, 0};
 static String lastScrollText[MAX_ROWS];
+static int tickerOffset = 0;  // disruption ticker horizontal scroll
 
 // Page rotation for cycling through groups
 static unsigned long lastRotateMs = 0;
@@ -1266,9 +1300,14 @@ void drawDisplay() {
             pageOffset = 0;
         }
 
+        // Reserve bottom strip for disruption ticker if active
+        bool showTicker = cfgShowDisruptions && !disruptions.empty();
+        int tickerH = showTicker ? 13 : 0;
+        int usableH = SCREEN_H - tickerH;
+
         int rows = min(totalSlots - pageOffset, MAX_ROWS);
         int totalSep = (rows - 1) * SEP_H;
-        int rowH = (SCREEN_H - totalSep) / rows;
+        int rowH = (usableH - totalSep) / rows;
 
         // Visible height for centering (Font 1 char = 7px, not 8px)
         int nameH = 7 * NAME_SZ;
@@ -1407,33 +1446,97 @@ void drawDisplay() {
                 int ax  = SCREEN_W - PX_MARGIN - tw;
                 int ay  = centerY - th / 2;
                 if (phase) {
-                    sprite.fillRect(ax + sz + gap, ay,           sz, sz, AMBER);
+                    sprite.fillRect(ax + sz + gap, ay,            sz, sz, AMBER);
                     sprite.fillRect(ax,            ay + sz + gap, sz, sz, AMBER);
                 } else {
-                    sprite.fillRect(ax,            ay,           sz, sz, AMBER);
+                    sprite.fillRect(ax,            ay,            sz, sz, AMBER);
                     sprite.fillRect(ax + sz + gap, ay + sz + gap, sz, sz, AMBER);
                 }
             } else {
-                sprite.setTextColor(AMBER, BG_COLOR);
+                // Main countdown
                 String cdStr = String(d.countdown);
                 int cdW = sprite.textWidth(cdStr);
-                drawGlowText(sprite, SCREEN_W - PX_MARGIN - cdW, centerY - cdH / 2, cdStr);
+
+                if (cfgShowNext) {
+                    // Find next departure for same line+direction
+                    int nextCd = -1;
+                    bool found1 = false;
+                    for (auto& dep : departures) {
+                        if (dep.lineName == d.lineName && dep.towards == d.towards) {
+                            if (!found1) { found1 = true; continue; }  // skip first (= current)
+                            nextCd = dep.countdown; break;
+                        }
+                    }
+
+                    if (nextCd >= 0) {
+                        // Stack: main countdown top, "→ Xmin" below
+                        int nextSz = 2;
+                        int nextH  = 7 * nextSz;
+                        int totalCdH = cdH + 3 + nextH;
+                        int topY = centerY - totalCdH / 2;
+                        drawGlowText(sprite, SCREEN_W - PX_MARGIN - cdW, topY, cdStr);
+                        sprite.setTextSize(nextSz);
+                        sprite.setTextColor(AMBER_DIM, BG_COLOR);
+                        String nextStr = ">" + String(nextCd);
+                        int nextW = sprite.textWidth(nextStr);
+                        sprite.setCursor(SCREEN_W - PX_MARGIN - nextW, topY + cdH + 3);
+                        sprite.print(nextStr);
+                        sprite.setTextSize(CD_SZ);
+                    } else {
+                        drawGlowText(sprite, SCREEN_W - PX_MARGIN - cdW, centerY - cdH / 2, cdStr);
+                    }
+                } else {
+                    drawGlowText(sprite, SCREEN_W - PX_MARGIN - cdW, centerY - cdH / 2, cdStr);
+                }
             }
         }
 
-        // ── Page indicator dots (if multiple pages) ──
-        if (totalSlots > MAX_ROWS) {
+        // ── Page indicator dots (if multiple pages, no ticker) ──
+        if (totalSlots > MAX_ROWS && !showTicker) {
             int pages = (totalSlots + MAX_ROWS - 1) / MAX_ROWS;
             int currentPage = pageOffset / MAX_ROWS;
             int dotR = 2;
             int dotGap = 8;
             int dotsW = pages * (dotR * 2) + (pages - 1) * dotGap;
             int dotX = (SCREEN_W - dotsW) / 2;
-            int dotY = SCREEN_H - 5;
+            int dotY = usableH - 5;
             for (int p = 0; p < pages; p++) {
                 uint16_t col = (p == currentPage) ? AMBER : AMBER_DIM;
                 sprite.fillCircle(dotX + p * (dotR * 2 + dotGap) + dotR, dotY, dotR, col);
             }
+        }
+
+        // ── Disruption ticker ──
+        if (showTicker) {
+            int ty = usableH;
+            sprite.fillRect(0, ty, SCREEN_W, tickerH, TFT_BLACK);
+            sprite.drawFastHLine(0, ty, SCREEN_W, AMBER_DIM);
+
+            // Build full ticker string from all disruptions
+            String tickerText = "";
+            for (size_t ti2 = 0; ti2 < disruptions.size(); ti2++) {
+                if (ti2 > 0) tickerText += "  |  ";
+                tickerText += disruptions[ti2];
+            }
+            tickerText += "     ";
+
+            TFT_eSprite tickerClip = TFT_eSprite(&tft);
+            tickerClip.createSprite(SCREEN_W, tickerH - 1);
+            tickerClip.fillSprite(TFT_BLACK);
+            tickerClip.setTextFont(1);
+            tickerClip.setTextSize(1);
+            tickerClip.setTextColor(AMBER_DIM, TFT_BLACK);
+            int textW = tickerClip.textWidth(tickerText);
+            tickerClip.setCursor(-tickerOffset, (tickerH - 1 - 7) / 2);
+            tickerClip.print(tickerText);
+            // Wrap-around copy
+            tickerClip.setCursor(-tickerOffset + textW, (tickerH - 1 - 7) / 2);
+            tickerClip.print(tickerText);
+            tickerClip.pushToSprite(&sprite, 0, ty + 1);
+            tickerClip.deleteSprite();
+
+            tickerOffset += 1;
+            if (tickerOffset >= textW) tickerOffset = 0;
         }
     }
     xSemaphoreGive(dataMutex);
