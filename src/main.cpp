@@ -1673,6 +1673,7 @@ void setup() {
     Serial.println("Wiener Linien Monitor starting...");
 
     tft.init();
+    delay(150);  // give ST7789 time to wake up before first draw
     tft.setRotation(1);
 
     // Fahrgastinformationssystem colors
