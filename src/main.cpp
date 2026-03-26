@@ -6,6 +6,7 @@
 #include <SPIFFS.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
+#include <ESPmDNS.h>
 #include <WebServer.h>
 #include <WiFiManager.h>
 #include <vector>
@@ -850,7 +851,7 @@ void handleWifiReset() {
     html += "<h1>WiFi Reset</h1>";
     html += "<div class='card'><p class='status'>Monitor startet neu...<br><br>";
     html += "Verbinde dich mit:<br><b style='color:#ffbf00;font-size:1.3em'>WienerLinienMonitor</b><br><br>";
-    html += "und waehle dein neues WLAN.</p></div></body></html>";
+    html += "Waehle dein WLAN, dann oeffne:<br><b style='color:#ffbf00'>wienerlinien.local</b></p></div></body></html>";
     server.send(200, "text/html", html);
     delay(1500);
     ESP.restart();
@@ -1259,18 +1260,25 @@ void drawDisplay() {
     if (cfgLines.empty() && cfgOebb.empty()) {
         // ── Setup screen ──
         sprite.setTextColor(AMBER, BG_COLOR);
-        sprite.setTextSize(3);
-        const char* s1 = "Setup:";
+        sprite.setTextSize(2);
+        const char* s1 = "Browser oeffnen:";
         int tw = sprite.textWidth(s1);
-        sprite.setCursor((SCREEN_W - tw) / 2, 10);
+        sprite.setCursor((SCREEN_W - tw) / 2, 8);
         sprite.print(s1);
         sprite.setTextSize(3);
-        String ip = WiFi.localIP().toString();
+        const char* hostname = "wienerlinien.local";
+        tw = sprite.textWidth(hostname);
+        sprite.setCursor((SCREEN_W - tw) / 2, 40);
+        sprite.print(hostname);
+        sprite.setTextColor(AMBER_DIM, BG_COLOR);
+        sprite.setTextSize(1);
+        String ip = "oder: " + WiFi.localIP().toString();
         tw = sprite.textWidth(ip);
-        sprite.setCursor((SCREEN_W - tw) / 2, 55);
+        sprite.setCursor((SCREEN_W - tw) / 2, 90);
         sprite.print(ip);
+        sprite.setTextColor(AMBER, BG_COLOR);
         sprite.setTextSize(2);
-        const char* s3 = "im Browser oeffnen";
+        const char* s3 = "Linien auswaehlen";
         tw = sprite.textWidth(s3);
         sprite.setCursor((SCREEN_W - tw) / 2, 120);
         sprite.print(s3);
@@ -1695,6 +1703,11 @@ void setup() {
         int ntpWaits = 0;
         while (!getLocalTime(&ti, 1000) && ntpWaits < 8) ntpWaits++;
         Serial.println(getLocalTime(&ti, 0) ? "NTP synced" : "NTP timeout, will retry");
+    }
+
+    if (MDNS.begin("wienerlinien")) {
+        MDNS.addService("http", "tcp", 80);
+        Serial.println("mDNS: wienerlinien.local");
     }
 
     Serial.println("Connected! IP: " + WiFi.localIP().toString());
