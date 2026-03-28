@@ -15,7 +15,7 @@
 #include <time.h>
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.0.2"
+#define FW_VERSION "1.0.3"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -38,6 +38,61 @@ static const char* CACHE_STEIGE_PATH = "/steige.csv";
 static const char* CACHE_LINIEN_PATH = "/linien.csv";
 static const char* CACHE_TS_PATH     = "/cache_ts";
 static const unsigned long CACHE_MAX_AGE_MS = 24UL * 60 * 60 * 1000; // 24h
+
+// ── Struct for discovered lines at a station ─────────────────────────
+struct FoundLine {
+    String rbl;
+    String lineName;
+    String towards;
+    String type;
+    String stopName;
+};
+
+// Direction cache: RBL → line name, towards, type
+static const char* DIR_CACHE_PATH = "/dir_cache.json";
+static std::map<String, FoundLine> dirCache;  // in-memory, periodically saved
+
+void loadDirCache() {
+    if (!SPIFFS.exists(DIR_CACHE_PATH)) return;
+    File f = SPIFFS.open(DIR_CACHE_PATH, "r");
+    if (!f) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, f)) { f.close(); return; }
+    f.close();
+    for (JsonPair kv : doc.as<JsonObject>()) {
+        FoundLine fl;
+        fl.rbl      = kv.key().c_str();
+        fl.lineName = kv.value()["n"] | "";
+        fl.towards  = kv.value()["t"] | "";
+        fl.type     = kv.value()["y"] | "";
+        fl.stopName = kv.value()["s"] | "";
+        if (fl.rbl.length() > 0 && fl.lineName.length() > 0) {
+            dirCache[fl.rbl] = fl;
+        }
+    }
+    Serial.printf("Direction cache loaded: %d entries\n", dirCache.size());
+}
+
+void saveDirCache() {
+    JsonDocument doc;
+    for (auto& pair : dirCache) {
+        JsonObject obj = doc[pair.first].to<JsonObject>();
+        obj["n"] = pair.second.lineName;
+        obj["t"] = pair.second.towards;
+        obj["y"] = pair.second.type;
+        obj["s"] = pair.second.stopName;
+    }
+    File f = SPIFFS.open(DIR_CACHE_PATH, "w");
+    if (!f) return;
+    serializeJson(doc, f);
+    f.close();
+}
+
+void cacheDirEntry(const String& rbl, const String& name, const String& towards, const String& type, const String& stop) {
+    FoundLine fl;
+    fl.rbl = rbl; fl.lineName = name; fl.towards = towards; fl.type = type; fl.stopName = stop;
+    dirCache[rbl] = fl;
+}
 
 static int  cfgRotateSec      = 5;     // page switch interval in seconds (default 5)
 static int  cfgBrightness     = 255;   // backlight 0-255 (default max)
@@ -234,15 +289,6 @@ bool refreshCsvCache(bool force = false) {
     return ok;
 }
 
-// ── Struct for discovered lines at a station ─────────────────────────
-struct FoundLine {
-    String rbl;
-    String lineName;
-    String towards;
-    String type;
-    String stopName;
-};
-
 // Look up line name and type from linien cache by LINIEN_ID
 // Linien CSV: "LINIEN_ID";"BEZEICHNUNG";"REIHENFOLGE";"ECHTZEIT";"VERKEHRSMITTEL";"STAND"
 bool lookupLineInfo(const String& linienId, String& outName, String& outType) {
@@ -434,10 +480,14 @@ std::vector<FoundLine> probeRbls(const std::vector<String>& rbls) {
                         dup = true; break;
                     }
                 }
-                if (!dup) results.push_back(fl);
+                if (!dup) {
+                    results.push_back(fl);
+                    cacheDirEntry(fl.rbl, fl.lineName, fl.towards, fl.type, fl.stopName);
+                }
             }
         }
     }
+    if (!results.empty()) saveDirCache();
     return results;
 }
 
@@ -660,25 +710,41 @@ void handleSearch() {
         }
     }
 
-    // Collect RBL list for realtime probe
-    std::vector<String> allRbls;
-    for (auto& s : allSteige) allRbls.push_back(s.rbl);
+    // Split RBLs: cached (instant) vs uncached (need API probe)
+    std::vector<FoundLine> lines;
+    std::vector<String> uncachedRbls;
 
-    tft.fillScreen(BG_COLOR);
-    tft.setCursor(10, 70);
-    tft.print("Lade Linien...");
-
-    // Try realtime API for currently running lines
-    auto lines = probeRbls(allRbls);
-
-    // Find RBLs that the realtime probe missed (lines not currently running)
-    // and add them from CSV data so they're always visible
     for (auto& si : allSteige) {
-        bool foundInProbe = false;
-        for (auto& fl : lines) {
-            if (fl.rbl == si.rbl) { foundInProbe = true; break; }
+        auto it = dirCache.find(si.rbl);
+        if (it != dirCache.end()) {
+            // Use cached direction info — no API call needed
+            bool dup = false;
+            for (auto& fl : lines) { if (fl.rbl == si.rbl) { dup = true; break; } }
+            if (!dup) lines.push_back(it->second);
+        } else {
+            uncachedRbls.push_back(si.rbl);
         }
-        if (foundInProbe) continue;
+    }
+
+    // Only probe uncached RBLs via realtime API
+    if (!uncachedRbls.empty()) {
+        tft.fillScreen(BG_COLOR);
+        tft.setCursor(10, 70);
+        tft.print("Lade Linien...");
+
+        auto probed = probeRbls(uncachedRbls);
+        for (auto& fl : probed) {
+            bool dup = false;
+            for (auto& l : lines) { if (l.rbl == fl.rbl) { dup = true; break; } }
+            if (!dup) lines.push_back(fl);
+        }
+    }
+
+    // Find RBLs still missing (not cached AND not in probe) — use CSV fallback
+    for (auto& si : allSteige) {
+        bool found = false;
+        for (auto& fl : lines) { if (fl.rbl == si.rbl) { found = true; break; } }
+        if (found) continue;
 
         // Look up line name and type from linien CSV
         String lineName, lineType;
@@ -1356,6 +1422,8 @@ void fetchDepartures() {
     http.end();
 
     JsonDocument filter;
+    filter["data"]["monitors"][0]["locationStop"]["properties"]["title"] = true;
+    filter["data"]["monitors"][0]["locationStop"]["properties"]["attributes"]["rbl"] = true;
     filter["data"]["monitors"][0]["lines"][0]["name"] = true;
     filter["data"]["monitors"][0]["lines"][0]["towards"] = true;
     filter["data"]["monitors"][0]["lines"][0]["type"] = true;
@@ -1371,14 +1439,26 @@ void fetchDepartures() {
     }
 
     std::vector<Departure> newDeps;
+    bool dirCacheUpdated = false;
     JsonArray monitors = doc["data"]["monitors"].as<JsonArray>();
     for (JsonObject monitor : monitors) {
+        String stopName = monitor["locationStop"]["properties"]["title"] | "";
+        String rbl = String((int)(monitor["locationStop"]["properties"]["attributes"]["rbl"] | 0));
         JsonArray lines = monitor["lines"].as<JsonArray>();
         for (JsonObject line : lines) {
             String name    = line["name"].as<String>();
             String towards = line["towards"].as<String>();
             String type    = line["type"].as<String>();
             bool   rt      = line["realtimeSupported"] | false;
+
+            // Cache direction info from live data
+            if (rbl.length() > 0 && name.length() > 0 && towards.length() > 0) {
+                if (dirCache.find(rbl) == dirCache.end() || dirCache[rbl].towards != towards) {
+                    cacheDirEntry(rbl, name, towards, type, stopName);
+                    dirCacheUpdated = true;
+                }
+            }
+
             JsonArray deps = line["departures"]["departure"].as<JsonArray>();
             for (JsonObject dep : deps) {
                 Departure d;
@@ -1416,6 +1496,8 @@ void fetchDepartures() {
             if (title.length() > 0) newDisruptions.push_back(sanitize(title));
         }
     }
+
+    if (dirCacheUpdated) saveDirCache();
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     departures   = newDeps;
@@ -2188,6 +2270,7 @@ void setup() {
     if (!SPIFFS.begin(true)) Serial.println("SPIFFS mount failed");
 
     loadConfig();
+    loadDirCache();
     ledcWrite(0, cfgBrightness);
 
     // Show loading status below splash
