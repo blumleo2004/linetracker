@@ -15,8 +15,8 @@
 #include <time.h>
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.0.1"
-#define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/main/version.json"
+#define FW_VERSION "1.0.2"
+#define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
 // ── Display ──────────────────────────────────────────────────────────
@@ -165,6 +165,9 @@ static SemaphoreHandle_t dataMutex;
 static const unsigned long FETCH_INTERVAL_MS = 20000;
 static bool fetchError = false;
 static volatile bool configChanged = false;   // triggers immediate refetch
+static volatile bool otaInProgress = false;
+static volatile int  otaPercent    = 0;
+static String        otaNewVersion = "";
 
 // ── Config Web Server ────────────────────────────────────────────────
 WebServer server(80);
@@ -1114,26 +1117,21 @@ bool checkOtaUpdate() {
 
     Serial.println("OTA: new version " + remoteVer + " available, updating...");
 
-    // Show update progress on display
-    tft.fillScreen(BG_COLOR);
-    tft.setTextColor(AMBER, BG_COLOR);
-    tft.setTextFont(1);
-    tft.setTextSize(2);
-    tft.setCursor(10, 40);
-    tft.print("Firmware Update...");
-    tft.setTextSize(1);
-    tft.setCursor(10, 80);
-    tft.print("v" + String(FW_VERSION) + " -> v" + remoteVer);
-    tft.setCursor(10, 100);
-    tft.print("Nicht ausschalten!");
+    // Signal display task to show OTA progress
+    otaNewVersion = remoteVer;
+    otaPercent = 0;
+    otaInProgress = true;
 
     WiFiClientSecure updClient;
     updClient.setInsecure();
 
-    // Follow redirects (GitHub releases redirect to S3)
     httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    httpUpdate.onProgress([](int cur, int total) {
+        if (total > 0) otaPercent = cur * 100 / total;
+    });
     t_httpUpdate_return ret = httpUpdate.update(updClient, binUrl);
 
+    otaInProgress = false;
     switch (ret) {
         case HTTP_UPDATE_OK:
             Serial.println("OTA: success, rebooting");
@@ -1149,17 +1147,75 @@ bool checkOtaUpdate() {
     return false;
 }
 
-void handleOtaCheck() {
-    String html = FPSTR(HTML_HEAD);
-    html += "<h1>Firmware Update</h1>";
-    html += "<div class='card'><p class='status'>Suche nach Updates...<br>Aktuelle Version: v" + String(FW_VERSION) + "</p></div></body></html>";
-    server.send(200, "text/html", html);
-    // Run update check after sending response
-    delay(100);
-    if (!checkOtaUpdate()) {
-        // No update found or failed — redirect back
-        // (if update succeeds, ESP restarts before reaching here)
+// Check version only (no flash), returns remote version or empty
+String checkRemoteVersion() {
+    if (WiFi.status() != WL_CONNECTED) return "";
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.begin(client, OTA_VERSION_URL);
+    http.setTimeout(10000);
+    int code = http.GET();
+    if (code != 200) {
+        Serial.printf("OTA check: HTTP %d\n", code);
+        http.end();
+        return "";
     }
+    String payload = http.getString();
+    http.end();
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) return "";
+    return doc["version"] | "";
+}
+
+void handleOtaCheck() {
+    String remoteVer = checkRemoteVersion();
+    String html = FPSTR(HTML_HEAD);
+    html += "<div class='card'><h2>Firmware Update</h2>";
+    html += "<p style='font-size:13px;color:#aaa;margin-bottom:12px'>Installiert: <b style='color:#eee'>v" + String(FW_VERSION) + "</b></p>";
+
+    if (remoteVer.length() == 0) {
+        html += "<p class='status'>Updateserver nicht erreichbar.</p>";
+    } else if (isNewerVersion(remoteVer, FW_VERSION)) {
+        html += "<p style='text-align:center;color:#1a8f3c;font-size:16px;font-weight:600;margin:12px 0'>v" + remoteVer + " verfuegbar!</p>";
+        html += "<a href='/update-now'><button class='add'>Jetzt updaten</button></a>";
+    } else {
+        html += "<p class='status'>Firmware ist aktuell.</p>";
+    }
+
+    html += "<br><a href='/'><button style='background:#555'>Zurueck</button></a>";
+    html += "</div></body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handleOtaDoUpdate() {
+    String html = FPSTR(HTML_HEAD);
+    html += "<div class='card' style='text-align:center'>";
+    html += "<h2>Update wird installiert...</h2>";
+    html += "<p style='color:#aaa;font-size:14px;margin:16px 0'>Bitte nicht ausschalten!<br>Der Monitor startet automatisch neu.</p>";
+    html += "<div style='margin:20px auto;width:80%;height:10px;background:#222;border-radius:5px'>";
+    html += "<div id='bar' style='width:0%;height:100%;background:#ffbf00;border-radius:5px;transition:width .5s'></div></div>";
+    html += "<p id='pct' style='color:#ffbf00;font-size:20px;font-weight:700'>0%</p>";
+    html += "</div>";
+    html += "<script>"
+            "var iv=setInterval(function(){"
+            "fetch('/update-progress').then(r=>r.json()).then(d=>{"
+            "document.getElementById('bar').style.width=d.p+'%';"
+            "document.getElementById('pct').textContent=d.p+'%';"
+            "if(d.p>=100){clearInterval(iv);document.getElementById('pct').textContent='Neustart...';}"
+            "}).catch(function(){clearInterval(iv);"
+            "document.getElementById('pct').textContent='Neustart...';"
+            "setTimeout(function(){location.href='/';},8000);"
+            "})},800);"
+            "</script></body></html>";
+    server.send(200, "text/html", html);
+    delay(200);
+    checkOtaUpdate();
+}
+
+void handleOtaProgress() {
+    String json = "{\"p\":" + String(otaPercent) + "}";
+    server.send(200, "application/json", json);
 }
 
 void startConfigServer() {
@@ -1174,6 +1230,8 @@ void startConfigServer() {
     server.on("/oebb-remove", HTTP_POST, handleOebbRemove);
     server.on("/wifi-reset", HTTP_POST, handleWifiReset);
     server.on("/update", handleOtaCheck);
+    server.on("/update-now", handleOtaDoUpdate);
+    server.on("/update-progress", handleOtaProgress);
     server.begin();
     configMode = true;
 }
@@ -1544,6 +1602,56 @@ void drawDisplay() {
     sprite.createSprite(SCREEN_W, SCREEN_H);
     sprite.fillSprite(BG_COLOR);
     sprite.setTextFont(1);
+
+    // ── OTA update progress screen ──
+    if (otaInProgress) {
+        sprite.setTextColor(AMBER, BG_COLOR);
+        sprite.setTextSize(3);
+        const char* brand = "LineTracker";
+        int tw = sprite.textWidth(brand);
+        sprite.setCursor((SCREEN_W - tw) / 2, 6);
+        sprite.print(brand);
+
+        sprite.drawFastHLine(40, 38, 240, AMBER_DIM);
+
+        sprite.setTextSize(2);
+        const char* msg = "Firmware Update";
+        tw = sprite.textWidth(msg);
+        sprite.setCursor((SCREEN_W - tw) / 2, 48);
+        sprite.print(msg);
+
+        sprite.setTextColor(AMBER_DIM, BG_COLOR);
+        sprite.setTextSize(1);
+        String verStr = "v" + String(FW_VERSION) + " -> v" + otaNewVersion;
+        tw = sprite.textWidth(verStr);
+        sprite.setCursor((SCREEN_W - tw) / 2, 72);
+        sprite.print(verStr);
+
+        // Progress bar
+        int barX = 30, barY = 92, barW = 260, barH = 16;
+        sprite.drawRect(barX, barY, barW, barH, AMBER_DIM);
+        int fillW = (barW - 4) * otaPercent / 100;
+        if (fillW > 0) sprite.fillRect(barX + 2, barY + 2, fillW, barH - 4, AMBER);
+
+        // Percentage
+        sprite.setTextColor(AMBER, BG_COLOR);
+        sprite.setTextSize(2);
+        String pctStr = String(otaPercent) + "%";
+        tw = sprite.textWidth(pctStr);
+        sprite.setCursor((SCREEN_W - tw) / 2, 118);
+        sprite.print(pctStr);
+
+        sprite.setTextColor(AMBER_DIM, BG_COLOR);
+        sprite.setTextSize(1);
+        const char* warn = "Nicht ausschalten!";
+        tw = sprite.textWidth(warn);
+        sprite.setCursor((SCREEN_W - tw) / 2, 150);
+        sprite.print(warn);
+
+        sprite.pushSprite(0, 0);
+        sprite.deleteSprite();
+        return;
+    }
 
     // WiFi status indicator (top-right when disconnected)
     if (WiFi.status() != WL_CONNECTED) {
