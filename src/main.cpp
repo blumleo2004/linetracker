@@ -15,7 +15,7 @@
 #include <time.h>
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.0.1"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/main/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -241,7 +241,7 @@ struct FoundLine {
 };
 
 // Look up line name and type from linien cache by LINIEN_ID
-// Linien CSV: "LINIEN_ID";"BEZEICHNUNG";"ECHTZEIT";"VERKEHRSMITTEL";"STAND"
+// Linien CSV: "LINIEN_ID";"BEZEICHNUNG";"REIHENFOLGE";"ECHTZEIT";"VERKEHRSMITTEL";"STAND"
 bool lookupLineInfo(const String& linienId, String& outName, String& outType) {
     File f = SPIFFS.open(CACHE_LINIEN_PATH, "r");
     if (!f) return false;
@@ -252,17 +252,20 @@ bool lookupLineInfo(const String& linienId, String& outName, String& outType) {
         String id = line.substring(0, s1);
         id.replace("\"", "");
         if (id != linienId) continue;
-        // BEZEICHNUNG
+        // BEZEICHNUNG (field 2)
         int s2 = line.indexOf(';', s1 + 1);
         if (s2 < 0) { f.close(); return false; }
         outName = line.substring(s1 + 1, s2);
         outName.replace("\"", "");
-        // skip ECHTZEIT
+        // skip REIHENFOLGE (field 3)
         int s3 = line.indexOf(';', s2 + 1);
         if (s3 < 0) { f.close(); return false; }
-        // VERKEHRSMITTEL
+        // skip ECHTZEIT (field 4)
         int s4 = line.indexOf(';', s3 + 1);
-        String vm = (s4 > 0) ? line.substring(s3 + 1, s4) : line.substring(s3 + 1);
+        if (s4 < 0) { f.close(); return false; }
+        // VERKEHRSMITTEL (field 5)
+        int s5 = line.indexOf(';', s4 + 1);
+        String vm = (s5 > 0) ? line.substring(s4 + 1, s5) : line.substring(s4 + 1);
         vm.replace("\"", "");
         vm.trim();
         outType = vm;
@@ -1176,27 +1179,54 @@ void startConfigServer() {
 }
 
 // ── WiFiManager ──────────────────────────────────────────────────────
-void showWifiSetupScreen(bool isReset) {
+void showWifiSetupScreen(const char* subtitle) {
     tft.fillScreen(BG_COLOR);
-    tft.setTextColor(AMBER, BG_COLOR);
     tft.setTextFont(1);
-    tft.setTextSize(3);
-    tft.setCursor(10, 10);
-    tft.print(isReset ? "WLAN aendern" : "WiFi Setup");
-    tft.setTextSize(2);
-    tft.setCursor(10, 50);
-    tft.print("1) Connect to WiFi:");
-    tft.setTextColor(TFT_YELLOW, BG_COLOR);
-    tft.setCursor(10, 75);
-    tft.print("  \"LineTracker\"");
+
+    // "LineTracker" branding
     tft.setTextColor(AMBER, BG_COLOR);
-    tft.setCursor(10, 105);
-    tft.print("2) Choose your network");
-    if (isReset) {
-        tft.setTextSize(1);
-        tft.setCursor(10, 140);
-        tft.print("(Timeout 3min -> altes WLAN)");
-    }
+    tft.setTextSize(3);
+    const char* brand = "LineTracker";
+    tft.setCursor((320 - tft.textWidth(brand)) / 2, 8);
+    tft.print(brand);
+
+    tft.drawFastHLine(60, 35, 200, AMBER_DIM);
+
+    // Subtitle
+    tft.setTextColor(AMBER_DIM, BG_COLOR);
+    tft.setTextSize(1);
+    int sw = tft.textWidth(subtitle);
+    tft.setCursor((320 - sw) / 2, 42);
+    tft.print(subtitle);
+
+    // Instructions
+    tft.setTextColor(AMBER, BG_COLOR);
+    tft.setTextSize(2);
+    const char* s1 = "1) WLAN verbinden:";
+    tft.setCursor((320 - tft.textWidth(s1)) / 2, 60);
+    tft.print(s1);
+
+    tft.setTextColor(tft.color565(255, 220, 60), BG_COLOR);
+    const char* ap = "\"LineTracker\"";
+    tft.setCursor((320 - tft.textWidth(ap)) / 2, 82);
+    tft.print(ap);
+
+    tft.setTextColor(AMBER, BG_COLOR);
+    const char* s2 = "2) Netzwerk waehlen";
+    tft.setCursor((320 - tft.textWidth(s2)) / 2, 108);
+    tft.print(s2);
+
+    tft.setTextColor(AMBER_DIM, BG_COLOR);
+    tft.setTextSize(1);
+    const char* hint = "Timeout: 3 Min";
+    tft.setCursor((320 - tft.textWidth(hint)) / 2, 140);
+    tft.print(hint);
+
+    // Attribution
+    tft.setTextColor(tft.color565(30, 24, 5), BG_COLOR);
+    const char* attr = "by Leo Blum";
+    tft.setCursor((320 - tft.textWidth(attr)) / 2, 158);
+    tft.print(attr);
 }
 
 void setupWiFi() {
@@ -1207,31 +1237,33 @@ void setupWiFi() {
     }
 
     if (wifiResetRequested) {
-        // User requested WiFi change — open portal directly
-        // Old credentials stay in NVS as fallback
-        showWifiSetupScreen(true);
-        wm.setConfigPortalTimeout(180);  // 3 min timeout
+        // User requested WiFi change — show setup screen immediately
+        showWifiSetupScreen("WLAN aendern");
+        wm.setConfigPortalTimeout(180);
         if (!wm.startConfigPortal("LineTracker")) {
-            // Timeout — no new WiFi selected, try old credentials
-            tft.fillScreen(BG_COLOR);
-            tft.setTextColor(AMBER, BG_COLOR);
+            // Timeout — try old credentials
+            tft.fillRect(0, 135, 320, 25, BG_COLOR);
+            tft.setTextColor(AMBER_DIM, BG_COLOR);
             tft.setTextFont(1);
-            tft.setTextSize(2);
-            tft.setCursor(10, 70);
-            tft.print("Verbinde mit altem WLAN...");
-            WiFi.begin();  // Uses stored NVS credentials
+            tft.setTextSize(1);
+            const char* msg = "Verbinde mit altem WLAN...";
+            tft.setCursor((320 - tft.textWidth(msg)) / 2, 140);
+            tft.print(msg);
+            WiFi.begin();
             unsigned long start = millis();
             while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
                 delay(500);
             }
             if (WiFi.status() != WL_CONNECTED) {
-                // Old WiFi also gone — restart and try again
                 ESP.restart();
             }
         }
     } else {
-        // Normal startup — auto-connect to saved WiFi, portal if needed
-        showWifiSetupScreen(false);
+        // Normal startup — try auto-connect, show portal if no saved WiFi
+        wm.setAPCallback([](WiFiManager* mgr) {
+            showWifiSetupScreen("Ersteinrichtung");
+        });
+        wm.setConnectTimeout(5);          // only wait 5s for saved WiFi
         wm.setConfigPortalTimeout(180);
         if (!wm.autoConnect("LineTracker")) {
             delay(3000);
@@ -1525,43 +1557,49 @@ void drawDisplay() {
     int totalSlots = displaySlots.size();
 
     if (cfgLines.empty() && cfgOebb.empty()) {
-        // ── Setup screen ──
+        // ── Setup screen (320×170) ──
+        // LineTracker branding
         sprite.setTextColor(AMBER, BG_COLOR);
-        sprite.setTextSize(3);
+        sprite.setTextSize(4);
         const char* brand = "LineTracker";
         int tw = sprite.textWidth(brand);
-        sprite.setCursor((SCREEN_W - tw) / 2, 5);
+        sprite.setCursor((SCREEN_W - tw) / 2, 6);
         sprite.print(brand);
 
-        sprite.setTextColor(AMBER_DIM, BG_COLOR);
-        sprite.setTextSize(1);
-        const char* s1 = "Browser oeffnen:";
-        tw = sprite.textWidth(s1);
-        sprite.setCursor((SCREEN_W - tw) / 2, 42);
-        sprite.print(s1);
+        sprite.drawFastHLine(40, 42, 240, AMBER_DIM);
 
+        // URL prominent
         sprite.setTextColor(AMBER, BG_COLOR);
         sprite.setTextSize(2);
         const char* hostname = "linetracker.local";
         tw = sprite.textWidth(hostname);
-        sprite.setCursor((SCREEN_W - tw) / 2, 60);
+        sprite.setCursor((SCREEN_W - tw) / 2, 54);
         sprite.print(hostname);
 
+        // IP fallback
         sprite.setTextColor(AMBER_DIM, BG_COLOR);
         sprite.setTextSize(1);
-        String ip = "oder: " + WiFi.localIP().toString();
+        String ip = WiFi.localIP().toString();
         tw = sprite.textWidth(ip);
-        sprite.setCursor((SCREEN_W - tw) / 2, 90);
+        sprite.setCursor((SCREEN_W - tw) / 2, 80);
         sprite.print(ip);
 
-        sprite.drawFastHLine(60, 108, 200, AMBER_DIM);
-
+        // Instruction
+        sprite.drawFastHLine(80, 98, 160, AMBER_DIM);
         sprite.setTextColor(AMBER, BG_COLOR);
         sprite.setTextSize(2);
         const char* s3 = "Linien auswaehlen";
         tw = sprite.textWidth(s3);
-        sprite.setCursor((SCREEN_W - tw) / 2, 120);
+        sprite.setCursor((SCREEN_W - tw) / 2, 108);
         sprite.print(s3);
+
+        // "by Leo Blum" subtle
+        sprite.setTextColor(tft.color565(30, 24, 5), BG_COLOR);
+        sprite.setTextSize(1);
+        const char* attr = "by Leo Blum";
+        tw = sprite.textWidth(attr);
+        sprite.setCursor((SCREEN_W - tw) / 2, 158);
+        sprite.print(attr);
     } else if (totalSlots == 0) {
         // ── Loading screen ──
         sprite.setTextColor(AMBER, BG_COLOR);
@@ -2052,38 +2090,44 @@ void setup() {
 
     setupWiFi();
 
-    tft.fillRect(0, 135, 320, 20, BG_COLOR);
-    tft.setCursor((320 - tft.textWidth("Synchronisiere Zeit...")) / 2, 140);
-    tft.print("Synchronisiere Zeit...");
-
-    // NTP time sync
-    configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
-    {
-        struct tm ti;
-        int ntpWaits = 0;
-        while (!getLocalTime(&ti, 1000) && ntpWaits < 8) ntpWaits++;
-        Serial.println(getLocalTime(&ti, 0) ? "NTP synced" : "NTP timeout, will retry");
-    }
-
-    tft.fillRect(0, 135, 320, 20, BG_COLOR);
-    tft.setCursor((320 - tft.textWidth("Lade Stationsdaten...")) / 2, 140);
-    tft.print("Lade Stationsdaten...");
-    refreshCsvCache();
-
+    // Start mDNS + web server immediately so user can access UI
     if (MDNS.begin("linetracker")) {
         MDNS.addService("http", "tcp", 80);
         Serial.println("mDNS: linetracker.local");
     }
-
     Serial.println("Connected! IP: " + WiFi.localIP().toString());
+    startConfigServer();
+
+    // Start display task immediately so setup screen with IP shows
+    dataMutex = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(displayTask, "display", 8192,  NULL, 1, NULL, 1);
+
+    // NTP + CSV cache in background — show status on splash
+    tft.fillRect(0, 135, 320, 25, BG_COLOR);
+    tft.setTextColor(AMBER_DIM, BG_COLOR);
+    tft.setTextFont(1);
+    tft.setTextSize(1);
+    tft.setCursor((320 - tft.textWidth("Synchronisiere...")) / 2, 140);
+    tft.print("Synchronisiere...");
+
+    configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
+    {
+        struct tm ti;
+        int ntpWaits = 0;
+        while (!getLocalTime(&ti, 1000) && ntpWaits < 4) ntpWaits++;
+        Serial.println(getLocalTime(&ti, 0) ? "NTP synced" : "NTP timeout, will retry");
+    }
+
+    tft.fillRect(0, 135, 320, 25, BG_COLOR);
+    tft.setCursor((320 - tft.textWidth("Lade Stationsdaten...")) / 2, 140);
+    tft.print("Lade Stationsdaten...");
+    refreshCsvCache();
+
     Serial.print("WL Lines: "); Serial.println(cfgLines.size());
     Serial.print("OeBB Stations: "); Serial.println(cfgOebb.size());
 
-    startConfigServer();
-
-    dataMutex = xSemaphoreCreateMutex();
+    // Start data fetch task (also handles periodic CSV refresh + OTA)
     xTaskCreatePinnedToCore(dataTask,    "data",    16384, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(displayTask, "display", 8192,  NULL, 1, NULL, 1);
 }
 
 void loop() {
