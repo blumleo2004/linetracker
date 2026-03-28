@@ -15,7 +15,7 @@
 #include <time.h>
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.0.3"
+#define FW_VERSION "1.0.4"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -655,6 +655,12 @@ void handleRoot() {
     html += "<button style='background:#e67e22'>WLAN aendern</button>";
     html += "</form></div>";
 
+    // Factory reset
+    html += "<div class='card'><h2>Zuruecksetzen</h2>";
+    html += "<form action='/factory-reset' method='POST' onsubmit=\"return confirm('Wirklich alles loeschen? Alle Linien und Einstellungen gehen verloren.')\">";
+    html += "<button style='background:#c0392b'>Werksreset</button>";
+    html += "</form></div>";
+
     // Firmware info + update
     html += "<div class='card'><h2>Firmware</h2>";
     html += "<p style='font-size:13px;color:#aaa;margin-bottom:8px'>Version: <b style='color:#eee'>v" + String(FW_VERSION) + "</b></p>";
@@ -1095,6 +1101,30 @@ void handleWifiReset() {
     ESP.restart();
 }
 
+void handleFactoryReset() {
+    // Erase config, caches, direction cache
+    SPIFFS.remove(CONFIG_PATH);
+    SPIFFS.remove(DIR_CACHE_PATH);
+    SPIFFS.remove(CACHE_HALT_PATH);
+    SPIFFS.remove(CACHE_STEIGE_PATH);
+    SPIFFS.remove(CACHE_LINIEN_PATH);
+    SPIFFS.remove(CACHE_TS_PATH);
+
+    // Reset WiFi credentials
+    WiFiManager wm;
+    wm.resetSettings();
+
+    String html = FPSTR(HTML_HEAD);
+    html += "<h1>Werksreset</h1>";
+    html += "<div class='card'><p class='status'>Alles geloescht!<br><br>";
+    html += "Monitor startet neu...<br><br>";
+    html += "Verbinde dich mit:<br><b style='color:#ffbf00;font-size:1.3em'>LineTracker</b><br><br>";
+    html += "Waehle dein WLAN, dann oeffne:<br><b style='color:#ffbf00'>linetracker.local</b></p></div></body></html>";
+    server.send(200, "text/html", html);
+    delay(1500);
+    ESP.restart();
+}
+
 void handleSettings() {
     if (server.hasArg("rotate_sec")) {
         cfgRotateSec = server.arg("rotate_sec").toInt();
@@ -1295,6 +1325,7 @@ void startConfigServer() {
     server.on("/oebb-save", HTTP_POST, handleOebbSave);
     server.on("/oebb-remove", HTTP_POST, handleOebbRemove);
     server.on("/wifi-reset", HTTP_POST, handleWifiReset);
+    server.on("/factory-reset", HTTP_POST, handleFactoryReset);
     server.on("/update", handleOtaCheck);
     server.on("/update-now", handleOtaDoUpdate);
     server.on("/update-progress", handleOtaProgress);
