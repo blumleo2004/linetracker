@@ -1,107 +1,93 @@
-# Wiener Linien Abfahrtsmonitor
+# LineTracker
 
-Real-time Vienna public transport departure display for the LILYGO T-Display-S3.
+**Real-time public transport departure display for Vienna.**
 
-Inspired by the dot-matrix amber LED passenger information displays found at tram and U-Bahn stops in Vienna.
+by Leo Blum
 
-![Display showing amber departure info on dark background](https://github.com/user-attachments/assets/placeholder)
+---
+
+LineTracker turns a LILYGO T-Display-S3 into a compact departure monitor that looks like the amber dot-matrix passenger information displays found at Vienna's tram and U-Bahn stops. Set it up once via your phone, and it shows live countdowns for your lines — no coding required.
 
 ## Features
 
-- **Real-time departures** from Wiener Linien (U-Bahn, Tram, Bus) and OeBB (S-Bahn, REX, trains)
-- **Dot-matrix amber LED style** display — looks like a real Fahrgastinformationssystem
-- **Smart display logic** — groups departures by line+direction, rotates pages fairly so no line is starved
-- **Scrolling direction text** — long destination names scroll automatically
-- **Web config interface** — set up entirely via browser, no coding needed
-- **Station search & browse** — search by name or browse A-Z
-- **WiFi management** — change WiFi without losing your line configuration
-- **OeBB train support** — add S-Bahn and train stations with line/direction selection
-- **Night mode** — auto-dim at configurable hours
-- **Adjustable settings** — page switch speed, brightness, night brightness
+- **Real-time departures** — U-Bahn, Tram, Bus (Wiener Linien) and S-Bahn/REX (OeBB)
+- **Dot-matrix amber LED style** — authentic Fahrgastinformationssystem look
+- **Web-based setup** — configure everything from your browser at `linetracker.local`
+- **Station search & browse** — find any stop by name or browse A-Z
+- **Smart display** — groups by line + direction, rotates pages, scrolls long text
+- **Night mode** — auto-dim between configurable hours
+- **Over-the-air updates** — firmware updates automatically over WiFi
+- **WiFi management** — change networks without losing your configuration
+- **Gift-friendly** — designed to be set up by anyone, no technical knowledge needed
 
 ## Hardware
 
-- **Board:** LILYGO T-Display-S3 1.9" (170x320px ST7789, 8-bit parallel interface)
-- **Framework:** PlatformIO + Arduino + ESP-IDF (FreeRTOS)
+| Component | Specification |
+|-----------|--------------|
+| Board | LILYGO T-Display-S3 1.9" |
+| Display | 170x320px ST7789, 8-bit parallel |
+| Framework | PlatformIO + Arduino + ESP-IDF (FreeRTOS) |
 
-## Setup
+## Quick Start
 
-### First time
-
-1. Flash the firmware (see below)
-2. Connect to WiFi network **"WienerLinienMonitor"** from your phone/laptop
-3. Select your home WiFi network and enter the password
-4. The display will show the ESP's IP address
-5. Open that IP in your browser
-
-### Adding lines (Wiener Linien)
-
-1. Open the web interface in your browser
-2. Type a station name in the search box (e.g. "Kutschkergasse") or browse A-Z
-3. Select the specific lines and directions you want
-4. Click "Ausgewaehlte hinzufuegen"
-
-### Adding trains (OeBB)
-
-1. Open the web interface
-2. Under "S-Bahn / Zuege" enter a station name (e.g. "Wien Rennweg")
-3. The ESP will search for the canonical station name and load available lines
-4. Select specific line+direction combinations (e.g. S 3 → Meidling)
-
-### Settings
-
-- **Seitenwechsel** — how long each page is shown before rotating (2-30s, default 5s)
-- **Helligkeit** — display brightness (applies immediately)
-- **Nachtmodus** — auto-dim between configurable hours (e.g. 22:00-07:00)
-
-### Buttons
-
-| Action | Result |
-|--------|--------|
-| Hold BOOT 3s, release | Open WiFi portal (line config is kept) |
-| Hold BOOT 10s | Factory reset (erases all config) |
-
-## Flashing
+### 1. Flash
 
 ```bash
-# Install PlatformIO, then:
-cd "wiener linien monitor"
+git clone https://github.com/blumleo2004/linetracker.git
+cd linetracker
 pio run --target upload
 ```
 
-Upload speed is set to 115200 baud for reliability. If the upload fails, hold BOOT while pressing RST to enter download mode manually.
+Upload speed is 115200 baud. If upload fails, hold BOOT while pressing RST to enter download mode.
 
-## APIs used
+### 2. Connect
 
-| Source | Endpoint |
-|--------|----------|
-| Wiener Linien real-time | `wienerlinien.at/ogd_realtime/monitor?rbl=...` |
-| Wiener Linien stations (CSV) | `data.wien.gv.at/csv/wienerlinien-ogd-haltestellen.csv` |
-| Wiener Linien RBLs (CSV) | `data.wien.gv.at/csv/wienerlinien-ogd-steige.csv` |
-| OeBB departures | `fahrplan.oebb.at/bin/stboard.exe/dn?outputMode=tickerDataOnly` |
-| OeBB station search | `fahrplan.oebb.at/bin/ajax-getstop.exe/dn` |
+1. On your phone/laptop, connect to the WiFi network **"LineTracker"**
+2. Select your home WiFi and enter the password
+3. Open **linetracker.local** in your browser
 
-No API keys required for any of these.
+### 3. Add Lines
 
-## Configuration storage
+**Wiener Linien (U-Bahn, Tram, Bus):**
+Search for a station name or browse A-Z, then select the lines and directions you want.
 
-Config is saved to SPIFFS at `/config.json`:
+**OeBB (S-Bahn, REX):**
+Under "S-Bahn / Zuege", search for a station (e.g. "Wien Rennweg") and select line + direction.
 
-```json
-{
-  "lines": [
-    { "rbl": "187", "name": "40", "towards": "Schottentor", "type": "ptTram" }
-  ],
-  "oebb": [
-    { "station": "Wien Rennweg", "line": "S 3", "towards": "Meidling Hauptstrasse" }
-  ],
-  "rotate_sec": 5,
-  "brightness": 255,
-  "night_from": 22,
-  "night_to": 7,
-  "night_bright": 20
-}
-```
+Lines that are not currently running (e.g. U-Bahn at night) are still shown and can be added.
+
+## Settings
+
+| Setting | Description |
+|---------|-------------|
+| Seitenwechsel | Page rotation interval (2-30 seconds) |
+| Helligkeit | Display brightness |
+| Nachtmodus | Auto-dim between configurable hours |
+| Naechste Abfahrt | Show next departure below countdown |
+| Stoerungsticker | Show disruption alerts at bottom |
+
+## Buttons
+
+| Action | Result |
+|--------|--------|
+| Hold BOOT 3s | WiFi reset (opens setup portal, keeps config) |
+| Hold BOOT 10s | Factory reset (erases everything) |
+
+## OTA Updates
+
+LineTracker checks for firmware updates automatically every 6 hours. You can also trigger a manual check via **linetracker.local/update**.
+
+See [OTA_UPDATE.md](OTA_UPDATE.md) for how to publish new releases.
+
+## Data Sources
+
+| Source | Provider | License |
+|--------|----------|---------|
+| Real-time departures | [Wiener Linien](https://www.wienerlinien.at) | OGD |
+| Station & line data | [Stadt Wien – data.wien.gv.at](https://data.wien.gv.at) | CC BY 4.0 |
+| S-Bahn / train departures | [OeBB/SCOTTY](https://fahrplan.oebb.at) | — |
+
+No API keys required.
 
 ## Libraries
 
@@ -109,6 +95,10 @@ Config is saved to SPIFFS at `/config.json`:
 - [ArduinoJson](https://arduinojson.org/) v7 — JSON parsing
 - [WiFiManager](https://github.com/tzapu/WiFiManager) — WiFi setup portal
 
-## Reference
+## License
 
-Inspired by [coppermilk/wiener_linien_esp32_monitor](https://github.com/coppermilk/wiener_linien_esp32_monitor).
+MIT
+
+---
+
+*Inspired by [coppermilk/wiener_linien_esp32_monitor](https://github.com/coppermilk/wiener_linien_esp32_monitor)*

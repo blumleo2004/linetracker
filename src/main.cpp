@@ -9,9 +9,15 @@
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <WiFiManager.h>
+#include <HTTPUpdate.h>
 #include <vector>
 #include <map>
 #include <time.h>
+
+// ── Firmware version ────────────────────────────────────────────────
+#define FW_VERSION "1.0.0"
+#define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/main/version.json"
+static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
 // ── Display ──────────────────────────────────────────────────────────
 TFT_eSPI tft = TFT_eSPI();
@@ -25,6 +31,13 @@ static uint16_t AMBER_DIM;   // dim amber for separators/glow
 // ── Config ───────────────────────────────────────────────────────────
 static const char* CONFIG_PATH = "/config.json";
 static const char* WIFI_RESET_FLAG = "/wifi_reset";
+
+// CSV cache on SPIFFS
+static const char* CACHE_HALT_PATH   = "/halt.csv";
+static const char* CACHE_STEIGE_PATH = "/steige.csv";
+static const char* CACHE_LINIEN_PATH = "/linien.csv";
+static const char* CACHE_TS_PATH     = "/cache_ts";
+static const unsigned long CACHE_MAX_AGE_MS = 24UL * 60 * 60 * 1000; // 24h
 
 static int  cfgRotateSec      = 5;     // page switch interval in seconds (default 5)
 static int  cfgBrightness     = 255;   // backlight 0-255 (default max)
@@ -157,7 +170,68 @@ static volatile bool configChanged = false;   // triggers immediate refetch
 WebServer server(80);
 static bool configMode = false;
 
-// Struct for discovered lines at a station
+// ── CSV Cache ────────────────────────────────────────────────────────
+bool downloadCsvToCache(const char* url, const char* path) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.begin(client, url);
+    http.setTimeout(20000);
+    int code = http.GET();
+    if (code != 200) { http.end(); return false; }
+
+    File f = SPIFFS.open(path, "w");
+    if (!f) { http.end(); return false; }
+
+    WiFiClient* stream = http.getStreamPtr();
+    uint8_t buf[512];
+    while (stream->available()) {
+        int len = stream->readBytes(buf, sizeof(buf));
+        f.write(buf, len);
+    }
+    f.close();
+    http.end();
+    return true;
+}
+
+bool isCacheValid() {
+    if (!SPIFFS.exists(CACHE_TS_PATH)) return false;
+    File f = SPIFFS.open(CACHE_TS_PATH, "r");
+    if (!f) return false;
+    String ts = f.readString();
+    f.close();
+    unsigned long cached = strtoul(ts.c_str(), NULL, 10);
+    return (millis() - cached) < CACHE_MAX_AGE_MS;
+}
+
+void saveCacheTimestamp() {
+    File f = SPIFFS.open(CACHE_TS_PATH, "w");
+    if (f) { f.print(millis()); f.close(); }
+}
+
+bool refreshCsvCache(bool force = false) {
+    if (!force && isCacheValid()
+        && SPIFFS.exists(CACHE_HALT_PATH)
+        && SPIFFS.exists(CACHE_STEIGE_PATH)
+        && SPIFFS.exists(CACHE_LINIEN_PATH)) {
+        Serial.println("CSV cache valid, skipping download");
+        return true;
+    }
+    Serial.println("Downloading CSV cache...");
+    bool ok = true;
+    ok &= downloadCsvToCache("https://data.wien.gv.at/csv/wienerlinien-ogd-haltestellen.csv", CACHE_HALT_PATH);
+    ok &= downloadCsvToCache("https://data.wien.gv.at/csv/wienerlinien-ogd-steige.csv", CACHE_STEIGE_PATH);
+    ok &= downloadCsvToCache("https://data.wien.gv.at/csv/wienerlinien-ogd-linien.csv", CACHE_LINIEN_PATH);
+    if (ok) {
+        saveCacheTimestamp();
+        Serial.println("CSV cache updated");
+    } else {
+        Serial.println("CSV cache download failed (partial)");
+    }
+    return ok;
+}
+
+// ── Struct for discovered lines at a station ─────────────────────────
 struct FoundLine {
     String rbl;
     String lineName;
@@ -166,37 +240,63 @@ struct FoundLine {
     String stopName;
 };
 
-// Search station by querying open data CSVs
+// Look up line name and type from linien cache by LINIEN_ID
+// Linien CSV: "LINIEN_ID";"BEZEICHNUNG";"ECHTZEIT";"VERKEHRSMITTEL";"STAND"
+bool lookupLineInfo(const String& linienId, String& outName, String& outType) {
+    File f = SPIFFS.open(CACHE_LINIEN_PATH, "r");
+    if (!f) return false;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        int s1 = line.indexOf(';');
+        if (s1 < 0) continue;
+        String id = line.substring(0, s1);
+        id.replace("\"", "");
+        if (id != linienId) continue;
+        // BEZEICHNUNG
+        int s2 = line.indexOf(';', s1 + 1);
+        if (s2 < 0) { f.close(); return false; }
+        outName = line.substring(s1 + 1, s2);
+        outName.replace("\"", "");
+        // skip ECHTZEIT
+        int s3 = line.indexOf(';', s2 + 1);
+        if (s3 < 0) { f.close(); return false; }
+        // VERKEHRSMITTEL
+        int s4 = line.indexOf(';', s3 + 1);
+        String vm = (s4 > 0) ? line.substring(s3 + 1, s4) : line.substring(s3 + 1);
+        vm.replace("\"", "");
+        vm.trim();
+        outType = vm;
+        f.close();
+        return true;
+    }
+    f.close();
+    return false;
+}
+
+// Search stations from cached haltestellen CSV
 std::vector<std::pair<String,String>> searchStations(const String& query) {
     std::vector<std::pair<String,String>> results;
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    http.begin(client, "https://data.wien.gv.at/csv/wienerlinien-ogd-haltestellen.csv");
-    http.setTimeout(15000);
-    int code = http.GET();
-    if (code != 200) { http.end(); return results; }
 
-    WiFiClient* stream = http.getStreamPtr();
+    File f = SPIFFS.open(CACHE_HALT_PATH, "r");
+    if (!f) return results;  // cache missing
+
     String lowerQuery = query;
     lowerQuery.toLowerCase();
 
-    while (stream->available()) {
-        String line = stream->readStringUntil('\n');
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
         String lowerLine = line;
         lowerLine.toLowerCase();
         if (lowerLine.indexOf(lowerQuery) >= 0) {
             // CSV: "HALTESTELLEN_ID";"TYP";"DIVA";"NAME";"GEMEINDE";...
             int s1 = line.indexOf(';');
             if (s1 < 0) continue;
-            // 1st field = HALTESTELLEN_ID (used to join with steige CSV)
             String haltId = line.substring(0, s1);
             haltId.replace("\"", "");
             int s2 = line.indexOf(';', s1 + 1);
             if (s2 < 0) continue;
             int s3 = line.indexOf(';', s2 + 1);
             if (s3 < 0) continue;
-            // 4th field = NAME
             int s4 = line.indexOf(';', s3 + 1);
             if (s4 < 0) continue;
             String name = line.substring(s3 + 1, s4);
@@ -207,24 +307,26 @@ std::vector<std::pair<String,String>> searchStations(const String& query) {
         }
         if (results.size() >= 10) break;
     }
-    http.end();
+    f.close();
     return results;
 }
 
-// Find all RBLs for a given halt ID
-std::vector<String> findRblsForStation(const String& haltId) {
-    std::vector<String> rbls;
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    http.begin(client, "https://data.wien.gv.at/csv/wienerlinien-ogd-steige.csv");
-    http.setTimeout(15000);
-    int code = http.GET();
-    if (code != 200) { http.end(); return rbls; }
+// Steige CSV: "STEIG_ID";"FK_LINIEN_ID";"FK_HALTESTELLEN_ID";"RICHTUNG";"REIHENFOLGE";"RBL_NUMMER";...
+struct SteigeInfo {
+    String rbl;
+    String linienId;
+    String richtung;  // "H" or "R"
+};
 
-    WiFiClient* stream = http.getStreamPtr();
-    while (stream->available()) {
-        String line = stream->readStringUntil('\n');
+// Find all RBLs (with line IDs) for a given station ID from cached steige CSV
+std::vector<SteigeInfo> findSteigeForStation(const String& haltId) {
+    std::vector<SteigeInfo> results;
+
+    File f = SPIFFS.open(CACHE_STEIGE_PATH, "r");
+    if (!f) return results;
+
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
         if (line.indexOf(haltId) < 0) continue;
         int s1 = line.indexOf(';');
         if (s1 < 0) continue;
@@ -235,20 +337,42 @@ std::vector<String> findRblsForStation(const String& haltId) {
         String foundHalt = line.substring(s2 + 1, s3);
         foundHalt.replace("\"", "");
         if (foundHalt != haltId) continue;
+
+        // RICHTUNG
         int s4 = line.indexOf(';', s3 + 1);
         if (s4 < 0) continue;
+        String richtung = line.substring(s3 + 1, s4);
+        richtung.replace("\"", "");
+
+        // skip REIHENFOLGE
         int s5 = line.indexOf(';', s4 + 1);
         if (s5 < 0) continue;
+        // RBL_NUMMER
         int s6 = line.indexOf(';', s5 + 1);
         if (s6 < 0) continue;
         String rbl = line.substring(s5 + 1, s6);
         rbl.replace("\"", "");
         rbl.trim();
-        bool found = false;
-        for (auto& r : rbls) { if (r == rbl) { found = true; break; } }
-        if (!found && rbl.length() > 0) rbls.push_back(rbl);
+
+        // FK_LINIEN_ID
+        String linienId = line.substring(s1 + 1, s2);
+        linienId.replace("\"", "");
+
+        if (rbl.length() > 0) {
+            bool dup = false;
+            for (auto& r : results) { if (r.rbl == rbl) { dup = true; break; } }
+            if (!dup) results.push_back({rbl, linienId, richtung});
+        }
     }
-    http.end();
+    f.close();
+    return results;
+}
+
+// Legacy wrapper: return just RBL strings
+std::vector<String> findRblsForStation(const String& haltId) {
+    auto steige = findSteigeForStation(haltId);
+    std::vector<String> rbls;
+    for (auto& s : steige) rbls.push_back(s.rbl);
     return rbls;
 }
 
@@ -315,35 +439,48 @@ std::vector<FoundLine> probeRbls(const std::vector<String>& rbls) {
 const char HTML_HEAD[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head>
 <meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Wiener Linien Monitor</title>
+<title>LineTracker</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#eee;padding:16px;max-width:500px;margin:0 auto}
-h1{color:#ffbf00;font-size:1.4em;margin-bottom:12px;text-align:center}
-h2{color:#ffbf00;font-size:1.1em;margin:16px 0 8px}
-.card{background:#16213e;border-radius:12px;padding:16px;margin-bottom:12px}
-input[type=text]{width:100%;padding:12px;border-radius:8px;border:1px solid #333;background:#0f3460;color:#fff;font-size:16px}
-button{background:#e94560;color:#fff;border:none;padding:12px 24px;border-radius:8px;font-size:16px;cursor:pointer;width:100%;margin-top:8px}
-button:hover{background:#c73652}
-button.add{background:#1a8f3c}
-button.add:hover{background:#15722f}
-.line-item{display:flex;align-items:center;gap:10px;padding:10px;border-bottom:1px solid #333}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d0d1a;color:#eee;padding:0 16px 16px;max-width:500px;margin:0 auto;-webkit-font-smoothing:antialiased}
+header{text-align:center;padding:20px 0 12px}
+header h1{color:#ffbf00;font-size:1.6em;letter-spacing:1px;margin:0}
+header p{color:#666;font-size:11px;margin-top:2px}
+h2{color:#ffbf00;font-size:1em;margin:14px 0 10px;letter-spacing:.5px;text-transform:uppercase;font-weight:600}
+.card{background:linear-gradient(145deg,#141428,#181830);border:1px solid #222;border-radius:14px;padding:16px;margin-bottom:14px;box-shadow:0 2px 12px rgba(0,0,0,.3)}
+input[type=text],input[type=number]{width:100%;padding:12px;border-radius:10px;border:1px solid #2a2a4a;background:#0a0a1e;color:#fff;font-size:16px;transition:border .2s}
+input[type=text]:focus,input[type=number]:focus{outline:none;border-color:#ffbf00}
+input[type=number]{width:60px;padding:8px;text-align:center}
+input[type=range]{width:100%;margin:8px 0;accent-color:#ffbf00;height:6px}
+button{background:linear-gradient(135deg,#e94560,#d63352);color:#fff;border:none;padding:12px 24px;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;width:100%;margin-top:8px;transition:transform .1s,box-shadow .2s;box-shadow:0 2px 8px rgba(233,69,96,.25)}
+button:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(233,69,96,.35)}
+button:active{transform:translateY(0)}
+button.add{background:linear-gradient(135deg,#1a8f3c,#158a35);box-shadow:0 2px 8px rgba(26,143,60,.25)}
+button.add:hover{box-shadow:0 4px 12px rgba(26,143,60,.35)}
+.line-item{display:flex;align-items:center;gap:10px;padding:12px 8px;border-bottom:1px solid rgba(255,255,255,.05);transition:background .15s}
 .line-item:last-child{border-bottom:none}
-.badge{display:inline-block;padding:4px 10px;border-radius:6px;color:#fff;font-weight:bold;min-width:40px;text-align:center;font-size:14px}
-.badge.metro{background:#b8834e}.badge.tram{background:#e43344}.badge.bus{background:#1664a5}.badge.train{background:#2e7d32}.badge.unknown{background:#666}
-.dir{flex:1;font-size:14px}
-.stop{font-size:11px;color:#888}
-input[type=checkbox]{width:20px;height:20px;accent-color:#e94560}
-.status{text-align:center;color:#888;padding:20px;font-size:14px}
-.rm{background:#c0392b;width:36px;min-width:36px;padding:8px 0;font-size:18px;margin:0;border-radius:50%}
-.rm:hover{background:#e74c3c}
-.msg{background:#1a8f3c;border-radius:8px;padding:12px;margin:8px 0;text-align:center}
-.letters{display:flex;flex-wrap:wrap;gap:4px;justify-content:center;margin:8px 0}
-.letters a{display:inline-block;width:32px;height:32px;line-height:32px;text-align:center;background:#0f3460;color:#ffbf00;border-radius:6px;text-decoration:none;font-weight:bold;font-size:14px}
-.letters a:hover,.letters a.act{background:#e94560;color:#fff}
-.stn{display:block;padding:10px;border-bottom:1px solid #333;color:#eee;text-decoration:none;font-size:15px}
-.stn:hover{background:#0f3460}
+.line-item:hover{background:rgba(255,191,0,.03);border-radius:8px}
+.badge{display:inline-block;padding:5px 12px;border-radius:8px;color:#fff;font-weight:700;min-width:44px;text-align:center;font-size:13px;letter-spacing:.5px;box-shadow:0 1px 4px rgba(0,0,0,.3)}
+.badge.metro{background:linear-gradient(135deg,#c9935a,#a87040)}
+.badge.tram{background:linear-gradient(135deg,#e94560,#c73652)}
+.badge.bus{background:linear-gradient(135deg,#1a6fc4,#1456a0)}
+.badge.train{background:linear-gradient(135deg,#388e3c,#2e7032)}
+.badge.unknown{background:#555}
+.dir{flex:1;font-size:14px;line-height:1.3}
+.stop{font-size:11px;color:#666;margin-top:2px}
+input[type=checkbox]{width:20px;height:20px;accent-color:#ffbf00;cursor:pointer}
+.status{text-align:center;color:#666;padding:20px;font-size:14px}
+.rm{background:linear-gradient(135deg,#c0392b,#a93226);width:36px;min-width:36px;padding:8px 0;font-size:16px;margin:0;border-radius:50%;box-shadow:0 1px 4px rgba(0,0,0,.3)}
+.rm:hover{background:linear-gradient(135deg,#e74c3c,#c0392b)}
+.msg{background:linear-gradient(135deg,#1a8f3c,#158a35);border-radius:10px;padding:12px;margin:8px 0;text-align:center;font-weight:600}
+.letters{display:flex;flex-wrap:wrap;gap:5px;justify-content:center;margin:10px 0}
+.letters a{display:inline-block;width:33px;height:33px;line-height:33px;text-align:center;background:#141428;color:#ffbf00;border-radius:8px;text-decoration:none;font-weight:700;font-size:13px;border:1px solid #222;transition:all .15s}
+.letters a:hover,.letters a.act{background:#ffbf00;color:#0d0d1a;border-color:#ffbf00}
+.stn{display:block;padding:11px 8px;border-bottom:1px solid rgba(255,255,255,.05);color:#eee;text-decoration:none;font-size:15px;transition:all .15s;border-radius:6px}
+.stn:hover{background:rgba(255,191,0,.06);padding-left:14px}
+label{display:block}
 </style></head><body>
+<header><h1>LineTracker</h1><p>by Leo Blum</p></header>
 )rawliteral";
 
 String badgeClassForType(const String& type) {
@@ -356,7 +493,7 @@ String badgeClassForType(const String& type) {
 
 void handleRoot() {
     String html = FPSTR(HTML_HEAD);
-    html += "<h1>Wiener Linien Monitor</h1>";
+
 
     // Show success message if redirected after save
     if (server.hasArg("saved")) {
@@ -404,7 +541,7 @@ void handleRoot() {
     html += "</form></div>";
 
     // Search form
-    html += "<div class='card'><h2>Wiener Linien Station suchen</h2>";
+    html += "<div class='card'><h2>Station suchen</h2>";
     html += "<form action='/search' method='GET'>";
     html += "<input type='text' name='q' placeholder='z.B. Kutschkergasse, Volksoper...' autofocus>";
     html += "<button type='submit'>Suchen</button>";
@@ -415,10 +552,12 @@ void handleRoot() {
     // Display settings
     html += "<div class='card'><h2>Einstellungen</h2>";
     html += "<form action='/settings' method='POST'>";
-    html += "<label style='font-size:13px;color:#aaa'>Seitenwechsel: <b style='color:#eee'>" + String(cfgRotateSec) + " Sek</b></label>";
-    html += "<input type='range' name='rotate_sec' min='2' max='30' value='" + String(cfgRotateSec) + "' style='width:100%;margin:8px 0'>";
-    html += "<label style='font-size:13px;color:#aaa'>Helligkeit: <b style='color:#eee'>" + String(cfgBrightness * 100 / 255) + "%</b></label>";
-    html += "<input type='range' name='brightness' min='10' max='255' value='" + String(cfgBrightness) + "' style='width:100%;margin:8px 0'>";
+
+    html += "<label style='font-size:13px;color:#aaa'>Seitenwechsel: <b id='v_rot' style='color:#eee'>" + String(cfgRotateSec) + " Sek</b></label>";
+    html += "<input type='range' name='rotate_sec' min='2' max='30' value='" + String(cfgRotateSec) + "' oninput=\"document.getElementById('v_rot').textContent=this.value+' Sek'\" style='width:100%;margin:8px 0'>";
+
+    html += "<label style='font-size:13px;color:#aaa'>Helligkeit: <b id='v_bri' style='color:#eee'>" + String(cfgBrightness * 100 / 255) + "%</b></label>";
+    html += "<input type='range' name='brightness' min='10' max='255' value='" + String(cfgBrightness) + "' oninput=\"document.getElementById('v_bri').textContent=Math.round(this.value*100/255)+'%'\" style='width:100%;margin:8px 0'>";
 
     // Night mode
     String nightFromVal = (cfgNightFrom >= 0) ? String(cfgNightFrom) : "22";
@@ -426,14 +565,19 @@ void handleRoot() {
     String nightBrVal   = String(cfgNightBright * 100 / 255);
     bool nightOn = (cfgNightFrom >= 0);
     html += "<div style='margin-top:12px'>";
-    html += "<label style='font-size:13px;color:#aaa'><input type='checkbox' name='night_on' value='1'";
+    html += "<label style='font-size:13px;color:#aaa'><input type='checkbox' name='night_on' value='1' id='cb_night'";
     if (nightOn) html += " checked";
-    html += " style='width:auto;margin-right:6px'>Nachtmodus aktiv</label></div>";
+    html += " style='width:auto;margin-right:6px' onchange=\"document.getElementById('night_opts').style.display=this.checked?'block':'none'\">Nachtmodus</label></div>";
+
+    html += "<div id='night_opts' style='display:";
+    html += nightOn ? "block" : "none";
+    html += "'>";
     html += "<div style='display:flex;gap:8px;margin:8px 0;font-size:13px;color:#aaa;align-items:center'>";
     html += "<span>Von</span><input type='number' name='night_from' min='0' max='23' value='" + nightFromVal + "' style='width:60px;padding:6px'>";
     html += "<span>bis</span><input type='number' name='night_to' min='0' max='23' value='" + nightToVal + "' style='width:60px;padding:6px'><span>Uhr</span></div>";
-    html += "<label style='font-size:13px;color:#aaa'>Nacht-Helligkeit: <b style='color:#eee'>" + nightBrVal + "%</b></label>";
-    html += "<input type='range' name='night_bright' min='0' max='100' value='" + nightBrVal + "' style='width:100%;margin:8px 0'>";
+    html += "<label style='font-size:13px;color:#aaa'>Nacht-Helligkeit: <b id='v_nbri' style='color:#eee'>" + nightBrVal + "%</b></label>";
+    html += "<input type='range' name='night_bright' min='0' max='100' value='" + nightBrVal + "' oninput=\"document.getElementById('v_nbri').textContent=this.value+'%'\" style='width:100%;margin:8px 0'>";
+    html += "</div>";
 
     // Extra features
     html += "<div style='margin-top:12px;display:flex;flex-direction:column;gap:8px'>";
@@ -454,6 +598,19 @@ void handleRoot() {
     html += "<form action='/wifi-reset' method='POST'>";
     html += "<button style='background:#e67e22'>WLAN aendern</button>";
     html += "</form></div>";
+
+    // Firmware info + update
+    html += "<div class='card'><h2>Firmware</h2>";
+    html += "<p style='font-size:13px;color:#aaa;margin-bottom:8px'>Version: <b style='color:#eee'>v" + String(FW_VERSION) + "</b></p>";
+    html += "<a href='/update'><button style='background:#0f3460'>Nach Update suchen</button></a>";
+    html += "</div>";
+
+    // Credits footer
+    html += "<div style='text-align:center;margin:20px 0 8px;font-size:11px;color:#555'>";
+    html += "<b style='color:#ffbf00'>LineTracker</b> by Leo Blum<br>";
+    html += "Daten: <a href='https://data.wien.gv.at' style='color:#666'>Stadt Wien &ndash; data.wien.gv.at</a> (CC BY 4.0)";
+    html += " &middot; <a href='https://fahrplan.oebb.at' style='color:#666'>OeBB/SCOTTY</a>";
+    html += "</div>";
 
     html += "</body></html>";
     server.send(200, "text/html", html);
@@ -478,41 +635,68 @@ void handleSearch() {
 
     if (stations.empty()) {
         String html = FPSTR(HTML_HEAD);
-        html += "<h1>Wiener Linien Monitor</h1>";
+    
         html += "<div class='card'><p class='status'>Keine Station gefunden fuer: " + query + "</p>";
         html += "<a href='/'><button>Zurueck</button></a></div></body></html>";
         server.send(200, "text/html", html);
         return;
     }
 
-    std::vector<String> allRbls;
+    // Collect all steige info (RBL + line ID + direction) from cached CSVs
+    std::vector<SteigeInfo> allSteige;
+    String firstStationName = stations[0].second;
     for (auto& st : stations) {
-        auto rbls = findRblsForStation(st.first);
-        for (auto& r : rbls) {
+        auto steige = findSteigeForStation(st.first);
+        for (auto& s : steige) {
             bool dup = false;
-            for (auto& a : allRbls) { if (a == r) { dup = true; break; } }
-            if (!dup) allRbls.push_back(r);
+            for (auto& a : allSteige) { if (a.rbl == s.rbl) { dup = true; break; } }
+            if (!dup) allSteige.push_back(s);
         }
     }
+
+    // Collect RBL list for realtime probe
+    std::vector<String> allRbls;
+    for (auto& s : allSteige) allRbls.push_back(s.rbl);
 
     tft.fillScreen(BG_COLOR);
     tft.setCursor(10, 70);
     tft.print("Lade Linien...");
 
+    // Try realtime API for currently running lines
     auto lines = probeRbls(allRbls);
 
+    // Find RBLs that the realtime probe missed (lines not currently running)
+    // and add them from CSV data so they're always visible
+    for (auto& si : allSteige) {
+        bool foundInProbe = false;
+        for (auto& fl : lines) {
+            if (fl.rbl == si.rbl) { foundInProbe = true; break; }
+        }
+        if (foundInProbe) continue;
+
+        // Look up line name and type from linien CSV
+        String lineName, lineType;
+        if (lookupLineInfo(si.linienId, lineName, lineType)) {
+            FoundLine fl;
+            fl.rbl = si.rbl;
+            fl.lineName = lineName;
+            fl.towards = (si.richtung == "H") ? "Richtung A" : "Richtung B";
+            fl.type = lineType;
+            fl.stopName = firstStationName + " (faehrt gerade nicht)";
+            lines.push_back(fl);
+        }
+    }
+
     String html = FPSTR(HTML_HEAD);
-    html += "<h1>Wiener Linien Monitor</h1>";
+
     html += "<div class='card'><h2>Ergebnisse: " + query + "</h2>";
 
     if (lines.empty()) {
-        html += "<p class='status'>Keine aktiven Linien gefunden</p>";
+        html += "<p class='status'>Keine Linien gefunden</p>";
     } else {
-        // Encode metadata in checkbox value: rbl|name|towards|type
         html += "<form action='/save' method='POST'>";
         for (size_t i = 0; i < lines.size(); i++) {
             auto& fl = lines[i];
-            // Check if already configured
             bool alreadyActive = false;
             for (auto& cl : cfgLines) {
                 if (cl.rbl == fl.rbl) { alreadyActive = true; break; }
@@ -647,7 +831,7 @@ void handleOebbSearch() {
     String stationName = searchOebbStation(query);
     if (stationName.length() == 0) {
         String html = FPSTR(HTML_HEAD);
-        html += "<h1>Wiener Linien Monitor</h1>";
+    
         html += "<div class='card'><p class='status'>OeBB-Station nicht gefunden: " + query + "</p>";
         html += "<a href='/'><button>Zurueck</button></a></div></body></html>";
         server.send(200, "text/html", html);
@@ -674,7 +858,7 @@ void handleOebbSearch() {
     }
 
     String html = FPSTR(HTML_HEAD);
-    html += "<h1>Wiener Linien Monitor</h1>";
+
     html += "<div class='card'><h2>" + stationName + "</h2>";
 
     if (combos.empty()) {
@@ -755,7 +939,7 @@ void handleOebbRemove() {
 
 void handleBrowse() {
     String html = FPSTR(HTML_HEAD);
-    html += "<h1>Wiener Linien Monitor</h1>";
+
     html += "<div class='card'><h2>Stationen A-Z</h2>";
 
     // Letter navigation
@@ -770,29 +954,15 @@ void handleBrowse() {
     html += "</div>";
 
     if (letter.length() == 1) {
-        // Fetch station CSV and list matching stations
-        tft.fillScreen(BG_COLOR);
-        tft.setTextColor(AMBER);
-        tft.setTextFont(1);
-        tft.setTextSize(2);
-        tft.setCursor(10, 70);
-        tft.print("Lade Stationen...");
+        // Read from cached haltestellen CSV
+        File f = SPIFFS.open(CACHE_HALT_PATH, "r");
 
-        WiFiClientSecure client;
-        client.setInsecure();
-        HTTPClient http;
-        http.begin(client, "https://data.wien.gv.at/csv/wienerlinien-ogd-haltestellen.csv");
-        http.setTimeout(15000);
-        int code = http.GET();
-
-        if (code == 200) {
-            WiFiClient* stream = http.getStreamPtr();
+        if (f) {
             std::vector<String> names;
             std::map<String, bool> seen;
 
-            while (stream->available()) {
-                String line = stream->readStringUntil('\n');
-                // CSV: "HALTESTELLEN_ID";"TYP";"DIVA";"NAME";...
+            while (f.available()) {
+                String line = f.readStringUntil('\n');
                 int s1 = line.indexOf(';');
                 if (s1 < 0) continue;
                 int s2 = line.indexOf(';', s1 + 1);
@@ -805,19 +975,16 @@ void handleBrowse() {
                 name.replace("\"", "");
                 if (name.length() == 0) continue;
 
-                // Check first letter matches
                 String firstChar = name.substring(0, 1);
                 firstChar.toUpperCase();
                 if (firstChar != letter) continue;
 
-                // Deduplicate by name
                 if (seen.find(name) != seen.end()) continue;
                 seen[name] = true;
                 names.push_back(name);
             }
-            http.end();
+            f.close();
 
-            // Sort alphabetically
             std::sort(names.begin(), names.end());
 
             if (names.empty()) {
@@ -831,8 +998,7 @@ void handleBrowse() {
                 }
             }
         } else {
-            http.end();
-            html += "<p class='status'>Fehler beim Laden der Stationen</p>";
+            html += "<p class='status'>Stationsdaten nicht verfuegbar. Bitte neu starten.</p>";
         }
     } else {
         html += "<p class='status'>Waehle einen Buchstaben</p>";
@@ -850,8 +1016,8 @@ void handleWifiReset() {
     String html = FPSTR(HTML_HEAD);
     html += "<h1>WiFi Reset</h1>";
     html += "<div class='card'><p class='status'>Monitor startet neu...<br><br>";
-    html += "Verbinde dich mit:<br><b style='color:#ffbf00;font-size:1.3em'>WienerLinienMonitor</b><br><br>";
-    html += "Waehle dein WLAN, dann oeffne:<br><b style='color:#ffbf00'>wienerlinien.local</b></p></div></body></html>";
+    html += "Verbinde dich mit:<br><b style='color:#ffbf00;font-size:1.3em'>LineTracker</b><br><br>";
+    html += "Waehle dein WLAN, dann oeffne:<br><b style='color:#ffbf00'>linetracker.local</b></p></div></body></html>";
     server.send(200, "text/html", html);
     delay(1500);
     ESP.restart();
@@ -883,14 +1049,114 @@ void handleSettings() {
     cfgShowNext        = server.hasArg("show_next");
     cfgShowDisruptions = server.hasArg("show_disruptions");
 
-    // Apply brightness immediately (night mode check will update if needed)
-    lastNightState = !lastNightState;  // force re-check
-    applyNightMode();
-    if (!lastNightState) ledcWrite(0, cfgBrightness);  // not night: apply day brightness
+    // Apply brightness immediately
+    if (cfgNightFrom >= 0 && cfgNightTo >= 0) {
+        struct tm ti;
+        if (getLocalTime(&ti, 0)) {
+            int h = ti.tm_hour;
+            bool isNight;
+            if (cfgNightFrom <= cfgNightTo) isNight = (h >= cfgNightFrom && h < cfgNightTo);
+            else isNight = (h >= cfgNightFrom || h < cfgNightTo);
+            ledcWrite(0, isNight ? cfgNightBright : cfgBrightness);
+            lastNightState = isNight;
+        }
+    } else {
+        ledcWrite(0, cfgBrightness);
+        lastNightState = false;
+    }
 
     saveConfig();
     server.sendHeader("Location", "/?saved=1");
     server.send(302);
+}
+
+// ── OTA Update ──────────────────────────────────────────────────────
+// Compare semantic versions: returns true if remote > local
+bool isNewerVersion(const String& remote, const String& local) {
+    int rMaj = 0, rMin = 0, rPat = 0;
+    int lMaj = 0, lMin = 0, lPat = 0;
+    sscanf(remote.c_str(), "%d.%d.%d", &rMaj, &rMin, &rPat);
+    sscanf(local.c_str(),  "%d.%d.%d", &lMaj, &lMin, &lPat);
+    if (rMaj != lMaj) return rMaj > lMaj;
+    if (rMin != lMin) return rMin > lMin;
+    return rPat > lPat;
+}
+
+// Check for OTA update, returns true if update was started
+bool checkOtaUpdate() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.begin(client, OTA_VERSION_URL);
+    http.setTimeout(10000);
+    int code = http.GET();
+    if (code != 200) { http.end(); return false; }
+
+    String payload = http.getString();
+    http.end();
+
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) return false;
+
+    String remoteVer = doc["version"] | "";
+    String binUrl    = doc["url"] | "";
+    if (remoteVer.length() == 0 || binUrl.length() == 0) return false;
+
+    if (!isNewerVersion(remoteVer, FW_VERSION)) {
+        Serial.println("OTA: up to date (v" + String(FW_VERSION) + ")");
+        return false;
+    }
+
+    Serial.println("OTA: new version " + remoteVer + " available, updating...");
+
+    // Show update progress on display
+    tft.fillScreen(BG_COLOR);
+    tft.setTextColor(AMBER, BG_COLOR);
+    tft.setTextFont(1);
+    tft.setTextSize(2);
+    tft.setCursor(10, 40);
+    tft.print("Firmware Update...");
+    tft.setTextSize(1);
+    tft.setCursor(10, 80);
+    tft.print("v" + String(FW_VERSION) + " -> v" + remoteVer);
+    tft.setCursor(10, 100);
+    tft.print("Nicht ausschalten!");
+
+    WiFiClientSecure updClient;
+    updClient.setInsecure();
+
+    // Follow redirects (GitHub releases redirect to S3)
+    httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    t_httpUpdate_return ret = httpUpdate.update(updClient, binUrl);
+
+    switch (ret) {
+        case HTTP_UPDATE_OK:
+            Serial.println("OTA: success, rebooting");
+            ESP.restart();
+            break;
+        case HTTP_UPDATE_FAILED:
+            Serial.printf("OTA: failed (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+            break;
+        case HTTP_UPDATE_NO_UPDATES:
+            Serial.println("OTA: no update needed");
+            break;
+    }
+    return false;
+}
+
+void handleOtaCheck() {
+    String html = FPSTR(HTML_HEAD);
+    html += "<h1>Firmware Update</h1>";
+    html += "<div class='card'><p class='status'>Suche nach Updates...<br>Aktuelle Version: v" + String(FW_VERSION) + "</p></div></body></html>";
+    server.send(200, "text/html", html);
+    // Run update check after sending response
+    delay(100);
+    if (!checkOtaUpdate()) {
+        // No update found or failed — redirect back
+        // (if update succeeds, ESP restarts before reaching here)
+    }
 }
 
 void startConfigServer() {
@@ -904,6 +1170,7 @@ void startConfigServer() {
     server.on("/oebb-save", HTTP_POST, handleOebbSave);
     server.on("/oebb-remove", HTTP_POST, handleOebbRemove);
     server.on("/wifi-reset", HTTP_POST, handleWifiReset);
+    server.on("/update", handleOtaCheck);
     server.begin();
     configMode = true;
 }
@@ -921,7 +1188,7 @@ void showWifiSetupScreen(bool isReset) {
     tft.print("1) Connect to WiFi:");
     tft.setTextColor(TFT_YELLOW, BG_COLOR);
     tft.setCursor(10, 75);
-    tft.print("  \"WienerLinienMonitor\"");
+    tft.print("  \"LineTracker\"");
     tft.setTextColor(AMBER, BG_COLOR);
     tft.setCursor(10, 105);
     tft.print("2) Choose your network");
@@ -944,7 +1211,7 @@ void setupWiFi() {
         // Old credentials stay in NVS as fallback
         showWifiSetupScreen(true);
         wm.setConfigPortalTimeout(180);  // 3 min timeout
-        if (!wm.startConfigPortal("WienerLinienMonitor")) {
+        if (!wm.startConfigPortal("LineTracker")) {
             // Timeout — no new WiFi selected, try old credentials
             tft.fillScreen(BG_COLOR);
             tft.setTextColor(AMBER, BG_COLOR);
@@ -966,7 +1233,7 @@ void setupWiFi() {
         // Normal startup — auto-connect to saved WiFi, portal if needed
         showWifiSetupScreen(false);
         wm.setConfigPortalTimeout(180);
-        if (!wm.autoConnect("WienerLinienMonitor")) {
+        if (!wm.autoConnect("LineTracker")) {
             delay(3000);
             ESP.restart();
         }
@@ -1260,22 +1527,35 @@ void drawDisplay() {
     if (cfgLines.empty() && cfgOebb.empty()) {
         // ── Setup screen ──
         sprite.setTextColor(AMBER, BG_COLOR);
-        sprite.setTextSize(2);
-        const char* s1 = "Browser oeffnen:";
-        int tw = sprite.textWidth(s1);
-        sprite.setCursor((SCREEN_W - tw) / 2, 8);
-        sprite.print(s1);
         sprite.setTextSize(3);
-        const char* hostname = "wienerlinien.local";
+        const char* brand = "LineTracker";
+        int tw = sprite.textWidth(brand);
+        sprite.setCursor((SCREEN_W - tw) / 2, 5);
+        sprite.print(brand);
+
+        sprite.setTextColor(AMBER_DIM, BG_COLOR);
+        sprite.setTextSize(1);
+        const char* s1 = "Browser oeffnen:";
+        tw = sprite.textWidth(s1);
+        sprite.setCursor((SCREEN_W - tw) / 2, 42);
+        sprite.print(s1);
+
+        sprite.setTextColor(AMBER, BG_COLOR);
+        sprite.setTextSize(2);
+        const char* hostname = "linetracker.local";
         tw = sprite.textWidth(hostname);
-        sprite.setCursor((SCREEN_W - tw) / 2, 40);
+        sprite.setCursor((SCREEN_W - tw) / 2, 60);
         sprite.print(hostname);
+
         sprite.setTextColor(AMBER_DIM, BG_COLOR);
         sprite.setTextSize(1);
         String ip = "oder: " + WiFi.localIP().toString();
         tw = sprite.textWidth(ip);
         sprite.setCursor((SCREEN_W - tw) / 2, 90);
         sprite.print(ip);
+
+        sprite.drawFastHLine(60, 108, 200, AMBER_DIM);
+
         sprite.setTextColor(AMBER, BG_COLOR);
         sprite.setTextSize(2);
         const char* s3 = "Linien auswaehlen";
@@ -1585,9 +1865,39 @@ void applyNightMode() {
 
 // ── FreeRTOS tasks ───────────────────────────────────────────────────
 void dataTask(void* param) {
+    unsigned long lastCacheRefresh = millis();
+    unsigned long lastOtaCheck = millis();
     for (;;) {
+        // Auto-reconnect WiFi if disconnected
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi lost, reconnecting...");
+            WiFi.disconnect();
+            WiFi.begin();  // uses stored NVS credentials
+            int retries = 0;
+            while (WiFi.status() != WL_CONNECTED && retries < 30) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                retries++;
+            }
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.println("WiFi reconnected: " + WiFi.localIP().toString());
+                MDNS.begin("linetracker");
+                MDNS.addService("http", "tcp", 80);
+            } else {
+                Serial.println("WiFi reconnect failed, will retry next cycle");
+            }
+        }
         fetchDepartures();
         fetchOebbDepartures();
+        // Refresh CSV cache every 24h
+        if (millis() - lastCacheRefresh > CACHE_MAX_AGE_MS) {
+            refreshCsvCache(true);
+            lastCacheRefresh = millis();
+        }
+        // Check for OTA updates every 6h
+        if (millis() - lastOtaCheck > OTA_CHECK_INTERVAL_MS) {
+            checkOtaUpdate();
+            lastOtaCheck = millis();
+        }
         // Wait 20s, but wake early if config changed
         for (int t = 0; t < 40; t++) {  // 40 × 500ms = 20s
             if (configChanged) {
@@ -1670,7 +1980,7 @@ void checkResetButton() {
 // ── Setup & Loop ─────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    Serial.println("Wiener Linien Monitor starting...");
+    Serial.println("LineTracker v" + String(FW_VERSION) + " starting...");
 
     tft.init();
     delay(150);  // give ST7789 time to wake up before first draw
@@ -1689,16 +1999,65 @@ void setup() {
     ledcAttachPin(TFT_BL, 0);
     ledcWrite(0, 255);  // start at full, updated after config loads
 
+    // ── Splash screen ───────────────────────────────────────────────
+    tft.setTextFont(1);
+    tft.setTextColor(AMBER, BG_COLOR);
+
+    // "LineTracker" centered, large
+    tft.setTextSize(4);
+    const char* brand = "LineTracker";
+    int bw = tft.textWidth(brand);
+    tft.setCursor((320 - bw) / 2, 30);
+    tft.print(brand);
+
+    // Decorative line
+    int lineY = 75;
+    tft.drawFastHLine(40, lineY, 240, AMBER_DIM);
+
+    // "by Leo Blum"
+    tft.setTextSize(2);
+    tft.setTextColor(AMBER_DIM, BG_COLOR);
+    const char* author = "by Leo Blum";
+    int aw = tft.textWidth(author);
+    tft.setCursor((320 - aw) / 2, 85);
+    tft.print(author);
+
+    // Version
+    tft.setTextSize(1);
+    String verStr = "v" + String(FW_VERSION);
+    int vw = tft.textWidth(verStr);
+    tft.setCursor((320 - vw) / 2, 112);
+    tft.print(verStr);
+
+    // Data attribution
+    tft.setTextColor(tft.color565(30, 24, 5), BG_COLOR);
+    const char* attr = "Data: Stadt Wien (CC BY 4.0) / OeBB";
+    int atw = tft.textWidth(attr);
+    tft.setCursor((320 - atw) / 2, 155);
+    tft.print(attr);
+
+    delay(2000);  // show splash for 2 seconds
+    // ── End splash ──────────────────────────────────────────────────
+
     if (!SPIFFS.begin(true)) Serial.println("SPIFFS mount failed");
 
     loadConfig();
-    ledcWrite(0, cfgBrightness);  // apply saved brightness
+    ledcWrite(0, cfgBrightness);
+
+    // Show loading status below splash
+    tft.setTextColor(AMBER_DIM, BG_COLOR);
+    tft.setTextSize(1);
+    tft.setCursor((320 - tft.textWidth("Verbinde WiFi...")) / 2, 140);
+    tft.print("Verbinde WiFi...");
+
     setupWiFi();
 
-    // NTP time sync (needed for ÖBB countdown calculation)
-    // Use POSIX tz string for auto DST: CET-1CEST,M3.5.0,M10.5.0/3
+    tft.fillRect(0, 135, 320, 20, BG_COLOR);
+    tft.setCursor((320 - tft.textWidth("Synchronisiere Zeit...")) / 2, 140);
+    tft.print("Synchronisiere Zeit...");
+
+    // NTP time sync
     configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
-    // Wait up to 8s for first sync so ÖBB countdowns are correct
     {
         struct tm ti;
         int ntpWaits = 0;
@@ -1706,9 +2065,14 @@ void setup() {
         Serial.println(getLocalTime(&ti, 0) ? "NTP synced" : "NTP timeout, will retry");
     }
 
-    if (MDNS.begin("wienerlinien")) {
+    tft.fillRect(0, 135, 320, 20, BG_COLOR);
+    tft.setCursor((320 - tft.textWidth("Lade Stationsdaten...")) / 2, 140);
+    tft.print("Lade Stationsdaten...");
+    refreshCsvCache();
+
+    if (MDNS.begin("linetracker")) {
         MDNS.addService("http", "tcp", 80);
-        Serial.println("mDNS: wienerlinien.local");
+        Serial.println("mDNS: linetracker.local");
     }
 
     Serial.println("Connected! IP: " + WiFi.localIP().toString());
