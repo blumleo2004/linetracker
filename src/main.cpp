@@ -1419,6 +1419,7 @@ void setupWiFi() {
             showWifiSetupScreen("Ersteinrichtung");
         });
         wm.setConnectTimeout(5);          // only wait 5s for saved WiFi
+        wm.setSaveConnectTimeout(30);     // wait 30s when user submits credentials in portal
         wm.setConfigPortalTimeout(180);
         if (!wm.autoConnect("LineTracker")) {
             delay(3000);
