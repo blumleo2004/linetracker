@@ -15,7 +15,7 @@
 #include <time.h>
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.1.1"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -571,6 +571,69 @@ std::vector<SteigeInfo> findSteigeForStation(const String& haltId) {
     return results;
 }
 
+// Query the monitor API to see what lines/directions are at given RBLs
+std::vector<FoundLine> probeRbls(const std::vector<String>& rbls) {
+    std::vector<FoundLine> results;
+    if (rbls.empty()) return results;
+
+    for (size_t start = 0; start < rbls.size(); start += 10) {
+        String url = "https://www.wienerlinien.at/ogd_realtime/monitor?activateTrafficInfo=stoerunglang";
+        size_t end = min(start + 10, rbls.size());
+        for (size_t i = start; i < end; i++) {
+            url += "&rbl=" + rbls[i];
+        }
+
+        WiFiClientSecure client;
+        client.setInsecure();
+        HTTPClient http;
+        http.begin(client, url);
+        http.setTimeout(12000);
+        int code = http.GET();
+        if (code != 200) { http.end(); continue; }
+
+        String payload = http.getString();
+        http.end();
+
+        JsonDocument filter;
+        filter["data"]["monitors"][0]["locationStop"]["properties"]["title"] = true;
+        filter["data"]["monitors"][0]["locationStop"]["properties"]["attributes"]["rbl"] = true;
+        filter["data"]["monitors"][0]["lines"][0]["name"] = true;
+        filter["data"]["monitors"][0]["lines"][0]["towards"] = true;
+        filter["data"]["monitors"][0]["lines"][0]["type"] = true;
+
+        JsonDocument doc;
+        if (deserializeJson(doc, payload, DeserializationOption::Filter(filter),
+                            DeserializationOption::NestingLimit(20))) continue;
+
+        JsonArray monitors = doc["data"]["monitors"].as<JsonArray>();
+        for (JsonObject mon : monitors) {
+            String stopName = mon["locationStop"]["properties"]["title"].as<String>();
+            String rbl = String((int)mon["locationStop"]["properties"]["attributes"]["rbl"]);
+            JsonArray lines = mon["lines"].as<JsonArray>();
+            for (JsonObject line : lines) {
+                FoundLine fl;
+                fl.rbl = rbl;
+                fl.lineName = line["name"].as<String>();
+                fl.towards = line["towards"].as<String>();
+                fl.type = line["type"].as<String>();
+                fl.stopName = stopName;
+                bool dup = false;
+                for (auto& r : results) {
+                    if (r.rbl == fl.rbl && r.lineName == fl.lineName && r.towards == fl.towards) {
+                        dup = true; break;
+                    }
+                }
+                if (!dup) {
+                    results.push_back(fl);
+                    cacheDirEntry(fl.rbl, fl.lineName, fl.towards, fl.type, fl.stopName);
+                }
+            }
+        }
+    }
+    if (!results.empty()) saveDirCache();
+    return results;
+}
+
 // ── HTML Templates ───────────────────────────────────────────────────
 const char HTML_HEAD[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head>
@@ -655,6 +718,11 @@ String badgeClassForType(const String& type) {
     if (type.startsWith("ptBus")) return "badge bus";
     if (type == "ptTrainS") return "badge train";
     return "badge unknown";
+}
+
+void sendHtml(const String& html) {
+    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    sendHtml(html);
 }
 
 void handleRoot() {
@@ -775,7 +843,7 @@ void handleRoot() {
     html += "</div>";
 
     html += "</body></html>";
-    server.send(200, "text/html", html);
+    sendHtml(html);
 }
 
 void handleSearch() {
@@ -793,50 +861,69 @@ void handleSearch() {
         html += "<div class='card'><p class='status'>Keine Station gefunden für:<br><b style='color:#e8e8f0'>" + query + "</b></p>";
         html += "<p class='hint' style='text-align:center'>Tipp: Versuche einen kürzeren Suchbegriff oder <a href='/browse' style='color:#ffbf00'>blättere durch alle Stationen</a>.</p>";
         html += "<a href='/'><button>Zurück</button></a></div></body></html>";
-        server.send(200, "text/html", html);
+        sendHtml(html);
         return;
     }
 
-    // Collect all lines from static data — no API call needed
+    // Hybrid search: static CSV data + dirCache + live API probe
+    // steige.csv only lists ONE line per platform, but multiple lines share platforms
+    // dirCache (from live departures) and API probe discover the real line set
+
     struct SearchResult {
         String rbl;
         String lineName;
         String towards;
         String type;
-        String stopName;
     };
     std::vector<SearchResult> results;
-    std::map<String, bool> seenLineDir;
+    std::map<String, bool> seenLineDir;  // dedupe by lineName|towards
 
+    // Collect all RBLs for matched stations
+    std::vector<SteigeInfo> allSteige;
     for (auto& st : stations) {
         auto steige = findSteigeForStation(st.first);
-        for (auto& si : steige) {
-            // Look up line info from static directions map
-            auto it = lineDirMap.find(si.linienId);
-            String lineName, type, towards;
-            if (it != lineDirMap.end()) {
-                lineName = it->second.name;
-                type     = it->second.type;
-                towards  = (si.richtung == "H") ? it->second.terminusH : it->second.terminusR;
-            } else {
-                // Fallback to linien.csv lookup
-                if (!lookupLineInfo(si.linienId, lineName, type)) continue;
-                towards = (si.richtung == "H") ? "Richtung H" : "Richtung R";
-            }
-            if (towards.length() == 0) towards = (si.richtung == "H") ? "Richtung H" : "Richtung R";
+        for (auto& s : steige) {
+            bool dup = false;
+            for (auto& a : allSteige) { if (a.rbl == s.rbl) { dup = true; break; } }
+            if (!dup) allSteige.push_back(s);
+        }
+    }
 
-            // Deduplicate by line name + direction
-            String key = lineName + "|" + towards;
+    // Layer 1: Add lines from dirCache (most accurate — from live departures)
+    std::vector<String> uncachedRbls;
+    for (auto& si : allSteige) {
+        auto it = dirCache.find(si.rbl);
+        if (it != dirCache.end()) {
+            String key = it->second.lineName + "|" + it->second.towards;
+            if (seenLineDir.find(key) == seenLineDir.end()) {
+                seenLineDir[key] = true;
+                results.push_back({si.rbl, it->second.lineName, it->second.towards, it->second.type});
+            }
+        } else {
+            uncachedRbls.push_back(si.rbl);
+        }
+    }
+
+    // Layer 2: Add lines from static lineDirMap (for lines not yet in dirCache)
+    for (auto& si : allSteige) {
+        auto it = lineDirMap.find(si.linienId);
+        if (it == lineDirMap.end()) continue;
+        String towards = (si.richtung == "H") ? it->second.terminusH : it->second.terminusR;
+        if (towards.length() == 0) towards = (si.richtung == "H") ? "Richtung H" : "Richtung R";
+        String key = it->second.name + "|" + towards;
+        if (seenLineDir.find(key) != seenLineDir.end()) continue;
+        seenLineDir[key] = true;
+        results.push_back({si.rbl, it->second.name, towards, it->second.type});
+    }
+
+    // Layer 3: Probe uncached RBLs via live API (discovers shared-platform lines)
+    if (!uncachedRbls.empty() && WiFi.status() == WL_CONNECTED) {
+        auto probed = probeRbls(uncachedRbls);
+        for (auto& fl : probed) {
+            String key = fl.lineName + "|" + fl.towards;
             if (seenLineDir.find(key) != seenLineDir.end()) continue;
             seenLineDir[key] = true;
-
-            SearchResult sr;
-            sr.rbl      = si.rbl;
-            sr.lineName = lineName;
-            sr.towards  = towards;
-            sr.type     = type;
-            sr.stopName = st.second;
-            results.push_back(sr);
+            results.push_back({fl.rbl, fl.lineName, fl.towards, fl.type});
         }
     }
 
@@ -858,7 +945,7 @@ void handleSearch() {
             auto& sr = results[i];
             bool alreadyActive = false;
             for (auto& cl : cfgLines) {
-                if (cl.rbl == sr.rbl) { alreadyActive = true; break; }
+                if (cl.rbl == sr.rbl && cl.name == sr.lineName) { alreadyActive = true; break; }
             }
 
             String val = sr.rbl + "|" + sr.lineName + "|" + sr.towards + "|" + sr.type;
@@ -875,7 +962,7 @@ void handleSearch() {
     }
 
     html += "<br><a href='/'><button>Zurück</button></a></div></body></html>";
-    server.send(200, "text/html", html);
+    sendHtml(html);
 }
 
 void handleSave() {
@@ -992,7 +1079,7 @@ void handleOebbSearch() {
     
         html += "<div class='card'><p class='status'>ÖBB-Station nicht gefunden: " + query + "</p>";
         html += "<a href='/'><button>Zurück</button></a></div></body></html>";
-        server.send(200, "text/html", html);
+        sendHtml(html);
         return;
     }
 
@@ -1045,7 +1132,7 @@ void handleOebbSearch() {
     }
 
     html += "<br><a href='/'><button>Zurück</button></a></div></body></html>";
-    server.send(200, "text/html", html);
+    sendHtml(html);
 }
 
 void handleOebbSave() {
@@ -1164,7 +1251,7 @@ void handleBrowse() {
     }
 
     html += "<br><a href='/'><button>Zurück</button></a></div></body></html>";
-    server.send(200, "text/html", html);
+    sendHtml(html);
 }
 
 void handleWifiReset() {
@@ -1176,7 +1263,7 @@ void handleWifiReset() {
     html += "<div class='card'><h2>WiFi Reset</h2><p class='status'>Monitor startet neu...<br><br>";
     html += "Verbinde dich mit:<br><b style='color:#ffbf00;font-size:1.3em'>LineTracker</b><br><br>";
     html += "Wähle dein WLAN, dann öffne:<br><b style='color:#ffbf00'>linetracker.local</b></p></div></body></html>";
-    server.send(200, "text/html", html);
+    sendHtml(html);
     delay(1500);
     ESP.restart();
 }
@@ -1198,7 +1285,7 @@ void handleFactoryReset() {
     html += "Monitor startet neu...<br><br>";
     html += "Verbinde dich mit:<br><b style='color:#ffbf00;font-size:1.3em'>LineTracker</b><br><br>";
     html += "Wähle dein WLAN, dann öffne:<br><b style='color:#ffbf00'>linetracker.local</b></p></div></body></html>";
-    server.send(200, "text/html", html);
+    sendHtml(html);
     delay(1500);
     ESP.restart();
 }
@@ -1359,7 +1446,7 @@ void handleOtaCheck() {
 
     html += "<br><a href='/'><button class='btn-secondary'>Zurück</button></a>";
     html += "</div></body></html>";
-    server.send(200, "text/html", html);
+    sendHtml(html);
 }
 
 void handleOtaDoUpdate() {
@@ -1382,7 +1469,7 @@ void handleOtaDoUpdate() {
             "setTimeout(function(){location.href='/';},8000);"
             "})},800);"
             "</script></body></html>";
-    server.send(200, "text/html", html);
+    sendHtml(html);
     delay(200);
     checkOtaUpdate();
 }
