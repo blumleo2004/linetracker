@@ -15,7 +15,7 @@
 #include <time.h>
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.1.1"
+#define FW_VERSION "1.1.2"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -2294,6 +2294,11 @@ void applyNightMode() {
 
 // ── FreeRTOS tasks ───────────────────────────────────────────────────
 void dataTask(void* param) {
+    // Build line directions on first run if missing (non-blocking — runs in background)
+    if (lineDirMap.empty() && SPIFFS.exists(CACHE_STEIGE_PATH)) {
+        Serial.println("Building line directions in background...");
+        buildLineDirections();
+    }
     unsigned long lastCacheRefresh = millis();
     unsigned long lastOtaCheck = millis();
     for (;;) {
@@ -2521,15 +2526,11 @@ void setup() {
     tft.setCursor((320 - tft.textWidth("Lade Stationsdaten...")) / 2, 140);
     tft.print("Lade Stationsdaten...");
     refreshCsvCache();
-    // Ensure line directions exist (build if missing, e.g. after OTA update)
-    if (lineDirMap.empty() && SPIFFS.exists(CACHE_STEIGE_PATH)) {
-        buildLineDirections();
-    }
 
     Serial.print("WL Lines: "); Serial.println(cfgLines.size());
     Serial.print("OeBB Stations: "); Serial.println(cfgOebb.size());
 
-    // Start data fetch task (also handles periodic CSV refresh + OTA)
+    // Start data fetch task immediately (also builds line directions on first run)
     xTaskCreatePinnedToCore(dataTask,    "data",    16384, NULL, 1, NULL, 0);
 }
 
