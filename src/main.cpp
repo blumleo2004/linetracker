@@ -15,7 +15,7 @@
 #include <time.h>
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.0.4"
+#define FW_VERSION "1.1.0"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -51,6 +51,16 @@ struct FoundLine {
 // Direction cache: RBL → line name, towards, type
 static const char* DIR_CACHE_PATH = "/dir_cache.json";
 static std::map<String, FoundLine> dirCache;  // in-memory, periodically saved
+
+// Static line directions: linienId → {name, type, terminusH, terminusR}
+static const char* LINE_DIRS_PATH = "/line_dirs.json";
+struct LineDirInfo {
+    String name;      // line designation (e.g. "10A", "U6")
+    String type;      // transport type (e.g. "ptTram", "ptMetro")
+    String terminusH; // end station direction H
+    String terminusR; // end station direction R
+};
+static std::map<String, LineDirInfo> lineDirMap;  // linienId → info
 
 void loadDirCache() {
     if (!SPIFFS.exists(DIR_CACHE_PATH)) return;
@@ -92,6 +102,27 @@ void cacheDirEntry(const String& rbl, const String& name, const String& towards,
     FoundLine fl;
     fl.rbl = rbl; fl.lineName = name; fl.towards = towards; fl.type = type; fl.stopName = stop;
     dirCache[rbl] = fl;
+}
+
+void loadLineDirections() {
+    lineDirMap.clear();
+    if (!SPIFFS.exists(LINE_DIRS_PATH)) return;
+    File f = SPIFFS.open(LINE_DIRS_PATH, "r");
+    if (!f) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, f)) { f.close(); return; }
+    f.close();
+    for (JsonPair kv : doc.as<JsonObject>()) {
+        LineDirInfo info;
+        info.name      = kv.value()["n"] | "";
+        info.type      = kv.value()["y"] | "";
+        info.terminusH = kv.value()["h"] | "";
+        info.terminusR = kv.value()["r"] | "";
+        if (info.name.length() > 0) {
+            lineDirMap[String(kv.key().c_str())] = info;
+        }
+    }
+    Serial.printf("Line directions loaded: %d lines\n", lineDirMap.size());
 }
 
 static int  cfgRotateSec      = 5;     // page switch interval in seconds (default 5)
@@ -267,6 +298,101 @@ void saveCacheTimestamp() {
     if (f) { f.print(millis()); f.close(); }
 }
 
+void buildLineDirections() {
+    Serial.println("Building line directions...");
+
+    // Step 1: Load all line info from linien.csv
+    std::map<String, std::pair<String,String>> lineInfoMap; // id → {name, type}
+    {
+        File f = SPIFFS.open(CACHE_LINIEN_PATH, "r");
+        if (!f) { Serial.println("linien.csv not found"); return; }
+        while (f.available()) {
+            String line = f.readStringUntil('\n');
+            int s1 = line.indexOf(';'); if (s1 < 0) continue;
+            String id = line.substring(0, s1); id.replace("\"", "");
+            int s2 = line.indexOf(';', s1 + 1); if (s2 < 0) continue;
+            String name = line.substring(s1 + 1, s2); name.replace("\"", "");
+            int s3 = line.indexOf(';', s2 + 1); if (s3 < 0) continue;
+            int s4 = line.indexOf(';', s3 + 1); if (s4 < 0) continue;
+            int s5 = line.indexOf(';', s4 + 1);
+            String type = (s5 > 0) ? line.substring(s4 + 1, s5) : line.substring(s4 + 1);
+            type.replace("\"", ""); type.trim();
+            if (name.length() > 0) lineInfoMap[id] = {name, type};
+        }
+        f.close();
+    }
+
+    // Step 2: Scan steige.csv for terminus stations (highest REIHENFOLGE per line+direction)
+    struct TermInfo { int maxH = -1; String haltH; int maxR = -1; String haltR; };
+    std::map<String, TermInfo> termMap;
+    {
+        File f = SPIFFS.open(CACHE_STEIGE_PATH, "r");
+        if (!f) { Serial.println("steige.csv not found"); return; }
+        while (f.available()) {
+            String line = f.readStringUntil('\n');
+            int s1 = line.indexOf(';'); if (s1 < 0) continue;
+            int s2 = line.indexOf(';', s1 + 1); if (s2 < 0) continue;
+            int s3 = line.indexOf(';', s2 + 1); if (s3 < 0) continue;
+            int s4 = line.indexOf(';', s3 + 1); if (s4 < 0) continue;
+            int s5 = line.indexOf(';', s4 + 1); if (s5 < 0) continue;
+            String linienId = line.substring(s1 + 1, s2); linienId.replace("\"", "");
+            String haltId   = line.substring(s2 + 1, s3); haltId.replace("\"", "");
+            String richtung = line.substring(s3 + 1, s4); richtung.replace("\"", "");
+            String seqStr   = line.substring(s4 + 1, s5); seqStr.replace("\"", "");
+            int seq = seqStr.toInt();
+            auto& ti = termMap[linienId];
+            if (richtung == "H" && seq > ti.maxH) { ti.maxH = seq; ti.haltH = haltId; }
+            else if (richtung == "R" && seq > ti.maxR) { ti.maxR = seq; ti.haltR = haltId; }
+        }
+        f.close();
+    }
+
+    // Step 3: Collect needed haltIds and resolve from halt.csv
+    std::map<String, String> haltNames;
+    for (auto& p : termMap) {
+        if (p.second.haltH.length() > 0) haltNames[p.second.haltH] = "";
+        if (p.second.haltR.length() > 0) haltNames[p.second.haltR] = "";
+    }
+    {
+        File f = SPIFFS.open(CACHE_HALT_PATH, "r");
+        if (!f) { Serial.println("halt.csv not found"); return; }
+        while (f.available()) {
+            String line = f.readStringUntil('\n');
+            int s1 = line.indexOf(';'); if (s1 < 0) continue;
+            String haltId = line.substring(0, s1); haltId.replace("\"", "");
+            if (haltNames.find(haltId) == haltNames.end()) continue;
+            int s2 = line.indexOf(';', s1 + 1); if (s2 < 0) continue;
+            int s3 = line.indexOf(';', s2 + 1); if (s3 < 0) continue;
+            int s4 = line.indexOf(';', s3 + 1); if (s4 < 0) continue;
+            String name = line.substring(s3 + 1, s4); name.replace("\"", "");
+            haltNames[haltId] = name;
+        }
+        f.close();
+    }
+
+    // Step 4: Build and save JSON
+    JsonDocument doc;
+    int count = 0;
+    for (auto& p : termMap) {
+        auto li = lineInfoMap.find(p.first);
+        if (li == lineInfoMap.end()) continue;
+        JsonObject obj = doc[p.first].to<JsonObject>();
+        obj["n"] = li->second.first;
+        obj["y"] = li->second.second;
+        obj["h"] = haltNames[p.second.haltH];
+        obj["r"] = haltNames[p.second.haltR];
+        count++;
+    }
+    {
+        File f = SPIFFS.open(LINE_DIRS_PATH, "w");
+        if (f) { serializeJson(doc, f); f.close(); }
+    }
+    Serial.printf("Line directions built: %d lines\n", count);
+
+    // Reload into memory
+    loadLineDirections();
+}
+
 bool refreshCsvCache(bool force = false) {
     if (!force && isCacheValid()
         && SPIFFS.exists(CACHE_HALT_PATH)
@@ -283,6 +409,7 @@ bool refreshCsvCache(bool force = false) {
     if (ok) {
         saveCacheTimestamp();
         Serial.println("CSV cache updated");
+        buildLineDirections();
     } else {
         Serial.println("CSV cache download failed (partial)");
     }
@@ -325,39 +452,63 @@ bool lookupLineInfo(const String& linienId, String& outName, String& outType) {
     return false;
 }
 
-// Search stations from cached haltestellen CSV
+// Normalize string for search: Umlauts to ASCII, lowercase
+String normalizeForSearch(const String& s) {
+    String r = s;
+    r.toLowerCase();
+    r.replace("ä", "ae"); r.replace("ö", "oe");
+    r.replace("ü", "ue"); r.replace("ß", "ss");
+    return r;
+}
+
+// Transport type priority for sorting search results
+int transportPriority(const String& type) {
+    if (type == "ptMetro") return 0;
+    if (type == "ptTram" || type == "ptTramWLB") return 1;
+    if (type.startsWith("ptBus")) return 2;
+    if (type == "ptTrainS") return 3;
+    return 4;
+}
+
+// Search stations from cached haltestellen CSV (Umlaut-tolerant)
 std::vector<std::pair<String,String>> searchStations(const String& query) {
     std::vector<std::pair<String,String>> results;
 
     File f = SPIFFS.open(CACHE_HALT_PATH, "r");
-    if (!f) return results;  // cache missing
+    if (!f) return results;
 
     String lowerQuery = query;
     lowerQuery.toLowerCase();
+    String normQuery = normalizeForSearch(query);
 
     while (f.available()) {
         String line = f.readStringUntil('\n');
-        String lowerLine = line;
-        lowerLine.toLowerCase();
-        if (lowerLine.indexOf(lowerQuery) >= 0) {
-            // CSV: "HALTESTELLEN_ID";"TYP";"DIVA";"NAME";"GEMEINDE";...
-            int s1 = line.indexOf(';');
-            if (s1 < 0) continue;
+        // CSV: "HALTESTELLEN_ID";"TYP";"DIVA";"NAME";"GEMEINDE";...
+        int s1 = line.indexOf(';');
+        if (s1 < 0) continue;
+        int s2 = line.indexOf(';', s1 + 1);
+        if (s2 < 0) continue;
+        int s3 = line.indexOf(';', s2 + 1);
+        if (s3 < 0) continue;
+        int s4 = line.indexOf(';', s3 + 1);
+        if (s4 < 0) continue;
+        String name = line.substring(s3 + 1, s4);
+        name.replace("\"", "");
+        if (name.length() == 0) continue;
+
+        // Match against both lowercase UTF-8 and normalized ASCII
+        String lowerName = name;
+        lowerName.toLowerCase();
+        String normName = normalizeForSearch(name);
+
+        if (lowerName.indexOf(lowerQuery) >= 0 || normName.indexOf(normQuery) >= 0) {
             String haltId = line.substring(0, s1);
             haltId.replace("\"", "");
-            int s2 = line.indexOf(';', s1 + 1);
-            if (s2 < 0) continue;
-            int s3 = line.indexOf(';', s2 + 1);
-            if (s3 < 0) continue;
-            int s4 = line.indexOf(';', s3 + 1);
-            if (s4 < 0) continue;
-            String name = line.substring(s3 + 1, s4);
-            name.replace("\"", "");
-            if (name.length() > 0 && haltId.length() > 0) {
+            if (haltId.length() > 0) {
                 results.push_back({haltId, name});
             }
         }
-        if (results.size() >= 10) break;
+        if (results.size() >= 15) break;
     }
     f.close();
     return results;
@@ -420,121 +571,80 @@ std::vector<SteigeInfo> findSteigeForStation(const String& haltId) {
     return results;
 }
 
-// Legacy wrapper: return just RBL strings
-std::vector<String> findRblsForStation(const String& haltId) {
-    auto steige = findSteigeForStation(haltId);
-    std::vector<String> rbls;
-    for (auto& s : steige) rbls.push_back(s.rbl);
-    return rbls;
-}
-
-// Query the monitor API to see what lines/directions are at given RBLs
-std::vector<FoundLine> probeRbls(const std::vector<String>& rbls) {
-    std::vector<FoundLine> results;
-    if (rbls.empty()) return results;
-
-    for (size_t start = 0; start < rbls.size(); start += 10) {
-        String url = "https://www.wienerlinien.at/ogd_realtime/monitor?activateTrafficInfo=stoerunglang";
-        size_t end = min(start + 10, rbls.size());
-        for (size_t i = start; i < end; i++) {
-            url += "&rbl=" + rbls[i];
-        }
-
-        WiFiClientSecure client;
-        client.setInsecure();
-        HTTPClient http;
-        http.begin(client, url);
-        http.setTimeout(15000);
-        int code = http.GET();
-        if (code != 200) { http.end(); continue; }
-
-        String payload = http.getString();
-        http.end();
-
-        JsonDocument filter;
-        filter["data"]["monitors"][0]["locationStop"]["properties"]["title"] = true;
-        filter["data"]["monitors"][0]["locationStop"]["properties"]["attributes"]["rbl"] = true;
-        filter["data"]["monitors"][0]["lines"][0]["name"] = true;
-        filter["data"]["monitors"][0]["lines"][0]["towards"] = true;
-        filter["data"]["monitors"][0]["lines"][0]["type"] = true;
-
-        JsonDocument doc;
-        if (deserializeJson(doc, payload, DeserializationOption::Filter(filter),
-                            DeserializationOption::NestingLimit(20))) continue;
-
-        JsonArray monitors = doc["data"]["monitors"].as<JsonArray>();
-        for (JsonObject mon : monitors) {
-            String stopName = mon["locationStop"]["properties"]["title"].as<String>();
-            String rbl = String((int)mon["locationStop"]["properties"]["attributes"]["rbl"]);
-            JsonArray lines = mon["lines"].as<JsonArray>();
-            for (JsonObject line : lines) {
-                FoundLine fl;
-                fl.rbl = rbl;
-                fl.lineName = line["name"].as<String>();
-                fl.towards = line["towards"].as<String>();
-                fl.type = line["type"].as<String>();
-                fl.stopName = stopName;
-                bool dup = false;
-                for (auto& r : results) {
-                    if (r.rbl == fl.rbl && r.lineName == fl.lineName && r.towards == fl.towards) {
-                        dup = true; break;
-                    }
-                }
-                if (!dup) {
-                    results.push_back(fl);
-                    cacheDirEntry(fl.rbl, fl.lineName, fl.towards, fl.type, fl.stopName);
-                }
-            }
-        }
-    }
-    if (!results.empty()) saveDirCache();
-    return results;
-}
-
 // ── HTML Templates ───────────────────────────────────────────────────
 const char HTML_HEAD[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head>
-<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1'>
 <title>LineTracker</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d0d1a;color:#eee;padding:0 16px 16px;max-width:500px;margin:0 auto;-webkit-font-smoothing:antialiased}
-header{text-align:center;padding:20px 0 12px}
-header h1{color:#ffbf00;font-size:1.6em;letter-spacing:1px;margin:0}
-header p{color:#666;font-size:11px;margin-top:2px}
-h2{color:#ffbf00;font-size:1em;margin:14px 0 10px;letter-spacing:.5px;text-transform:uppercase;font-weight:600}
-.card{background:linear-gradient(145deg,#141428,#181830);border:1px solid #222;border-radius:14px;padding:16px;margin-bottom:14px;box-shadow:0 2px 12px rgba(0,0,0,.3)}
-input[type=text],input[type=number]{width:100%;padding:12px;border-radius:10px;border:1px solid #2a2a4a;background:#0a0a1e;color:#fff;font-size:16px;transition:border .2s}
-input[type=text]:focus,input[type=number]:focus{outline:none;border-color:#ffbf00}
-input[type=number]{width:60px;padding:8px;text-align:center}
-input[type=range]{width:100%;margin:8px 0;accent-color:#ffbf00;height:6px}
-button{background:linear-gradient(135deg,#e94560,#d63352);color:#fff;border:none;padding:12px 24px;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;width:100%;margin-top:8px;transition:transform .1s,box-shadow .2s;box-shadow:0 2px 8px rgba(233,69,96,.25)}
-button:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(233,69,96,.35)}
-button:active{transform:translateY(0)}
-button.add{background:linear-gradient(135deg,#1a8f3c,#158a35);box-shadow:0 2px 8px rgba(26,143,60,.25)}
-button.add:hover{box-shadow:0 4px 12px rgba(26,143,60,.35)}
-.line-item{display:flex;align-items:center;gap:10px;padding:12px 8px;border-bottom:1px solid rgba(255,255,255,.05);transition:background .15s}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;background:#0a0a16;color:#e8e8f0;padding:0 16px 24px;max-width:520px;margin:0 auto;-webkit-font-smoothing:antialiased;line-height:1.5}
+header{text-align:center;padding:24px 0 16px}
+header h1{color:#ffbf00;font-size:1.7em;letter-spacing:1.5px;margin:0;font-weight:700}
+header p{color:#555;font-size:11px;margin-top:4px;letter-spacing:.5px}
+h2{color:#ffbf00;font-size:.85em;margin:16px 0 12px;letter-spacing:1px;text-transform:uppercase;font-weight:600}
+.card{background:#12122a;border:1px solid rgba(255,255,255,.06);border-radius:16px;padding:18px;margin-bottom:16px;box-shadow:0 4px 20px rgba(0,0,0,.4)}
+input[type=text],input[type=number]{width:100%;padding:14px 16px;border-radius:12px;border:1px solid rgba(255,255,255,.1);background:#0a0a1e;color:#fff;font-size:16px;transition:border .2s,box-shadow .2s}
+input[type=text]:focus,input[type=number]:focus{outline:none;border-color:#ffbf00;box-shadow:0 0 0 3px rgba(255,191,0,.15)}
+input[type=number]{width:70px;padding:10px;text-align:center}
+input[type=range]{width:100%;margin:10px 0;accent-color:#ffbf00;height:6px;cursor:pointer}
+button{background:#e94560;color:#fff;border:none;padding:14px 24px;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;width:100%;margin-top:10px;transition:transform .1s,opacity .15s;-webkit-tap-highlight-color:transparent}
+button:hover{opacity:.9;transform:translateY(-1px)}
+button:active{transform:scale(.98);opacity:.8}
+button.add{background:#1a8f3c}
+.line-item{display:flex;align-items:center;gap:12px;padding:14px 10px;border-bottom:1px solid rgba(255,255,255,.04);transition:background .15s}
 .line-item:last-child{border-bottom:none}
-.line-item:hover{background:rgba(255,191,0,.03);border-radius:8px}
-.badge{display:inline-block;padding:5px 12px;border-radius:8px;color:#fff;font-weight:700;min-width:44px;text-align:center;font-size:13px;letter-spacing:.5px;box-shadow:0 1px 4px rgba(0,0,0,.3)}
-.badge.metro{background:linear-gradient(135deg,#c9935a,#a87040)}
-.badge.tram{background:linear-gradient(135deg,#e94560,#c73652)}
-.badge.bus{background:linear-gradient(135deg,#1a6fc4,#1456a0)}
-.badge.train{background:linear-gradient(135deg,#388e3c,#2e7032)}
+.badge{display:inline-flex;align-items:center;justify-content:center;padding:6px 14px;border-radius:8px;color:#fff;font-weight:700;min-width:48px;text-align:center;font-size:14px;letter-spacing:.5px;flex-shrink:0}
+.badge.metro{background:#c9935a}
+.badge.tram{background:#e94560}
+.badge.bus{background:#2d7cd6}
+.badge.train{background:#388e3c}
 .badge.unknown{background:#555}
-.dir{flex:1;font-size:14px;line-height:1.3}
-.stop{font-size:11px;color:#666;margin-top:2px}
-input[type=checkbox]{width:20px;height:20px;accent-color:#ffbf00;cursor:pointer}
-.status{text-align:center;color:#666;padding:20px;font-size:14px}
-.rm{background:linear-gradient(135deg,#c0392b,#a93226);width:36px;min-width:36px;padding:8px 0;font-size:16px;margin:0;border-radius:50%;box-shadow:0 1px 4px rgba(0,0,0,.3)}
-.rm:hover{background:linear-gradient(135deg,#e74c3c,#c0392b)}
-.msg{background:linear-gradient(135deg,#1a8f3c,#158a35);border-radius:10px;padding:12px;margin:8px 0;text-align:center;font-weight:600}
-.letters{display:flex;flex-wrap:wrap;gap:5px;justify-content:center;margin:10px 0}
-.letters a{display:inline-block;width:33px;height:33px;line-height:33px;text-align:center;background:#141428;color:#ffbf00;border-radius:8px;text-decoration:none;font-weight:700;font-size:13px;border:1px solid #222;transition:all .15s}
-.letters a:hover,.letters a.act{background:#ffbf00;color:#0d0d1a;border-color:#ffbf00}
-.stn{display:block;padding:11px 8px;border-bottom:1px solid rgba(255,255,255,.05);color:#eee;text-decoration:none;font-size:15px;transition:all .15s;border-radius:6px}
-.stn:hover{background:rgba(255,191,0,.06);padding-left:14px}
+.dir{flex:1;font-size:14px;line-height:1.4;min-width:0}
+.stop{font-size:12px;color:#666;margin-top:3px}
+input[type=checkbox]{width:22px;height:22px;accent-color:#ffbf00;cursor:pointer;flex-shrink:0}
+.status{text-align:center;color:#666;padding:24px 8px;font-size:14px;line-height:1.6}
+.rm{background:#c0392b;width:38px;min-width:38px;height:38px;padding:0;font-size:18px;margin:0;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+.msg{background:#1a8f3c;border-radius:12px;padding:14px;margin:10px 0;text-align:center;font-weight:600}
+.letters{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin:12px 0}
+.letters a{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;background:#12122a;color:#ffbf00;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;border:1px solid rgba(255,255,255,.06);transition:all .15s;-webkit-tap-highlight-color:transparent}
+.letters a:hover,.letters a.act{background:#ffbf00;color:#0a0a16;border-color:#ffbf00}
+.stn{display:block;padding:13px 10px;border-bottom:1px solid rgba(255,255,255,.04);color:#e8e8f0;text-decoration:none;font-size:15px;transition:all .15s;border-radius:8px}
+.stn:hover{background:rgba(255,191,0,.05);padding-left:16px}
 label{display:block}
+.setting{margin-top:14px}
+.setting-label{font-size:13px;color:#888;display:flex;align-items:center;justify-content:space-between}
+.setting-label b{color:#e8e8f0}
+.btn-secondary{background:#1e1e3a;color:#ccc;font-weight:500}
+.btn-secondary:hover{background:#282848}
+.btn-warn{background:#e67e22}
+.btn-danger{background:#c0392b}
+.btn-info{background:#1a5276}
+.info-text{font-size:13px;color:#888;margin-bottom:10px}
+.info-text b{color:#e8e8f0}
+.hint{font-size:12px;color:#555;margin-bottom:10px}
+.check-label{font-size:13px;color:#888;display:flex;align-items:center;gap:8px}
+.check-label input{width:auto;flex-shrink:0}
+.footer{text-align:center;margin:24px 0 12px;font-size:11px;color:#444;line-height:1.8}
+.footer b{color:#ffbf00}
+.footer a{color:#555}
+.time-row{display:flex;gap:8px;margin:10px 0;font-size:13px;color:#888;align-items:center}
+.options-col{margin-top:16px;display:flex;flex-direction:column;gap:10px}
+.stn-count{color:#888;font-size:12px;margin:4px 0}
+@media(max-width:380px){
+body{padding:0 10px 20px}
+.card{padding:14px;border-radius:12px}
+button{padding:12px 16px;font-size:14px}
+.badge{padding:5px 10px;font-size:12px;min-width:40px}
+.line-item{gap:8px;padding:12px 6px}
+.letters a{width:32px;height:32px;font-size:12px}
+header h1{font-size:1.4em}
+}
+@media(min-width:600px){
+body{padding:0 24px 32px}
+.card{padding:22px}
+.line-item{padding:16px 12px}
+}
 </style></head><body>
 <header><h1>LineTracker</h1><p>by Leo Blum</p></header>
 )rawliteral";
@@ -551,12 +661,10 @@ void handleRoot() {
     String html = FPSTR(HTML_HEAD);
 
 
-    // Show success message if redirected after save
     if (server.hasArg("saved")) {
         html += "<div class='msg'>Linien gespeichert!</div>";
     }
 
-    // Show currently configured lines with badges and individual remove
     html += "<div class='card'><h2>Aktive Linien</h2>";
     if (cfgLines.empty()) {
         html += "<p class='status'>Noch keine Linien konfiguriert.<br>Suche unten eine Station.</p>";
@@ -574,10 +682,9 @@ void handleRoot() {
     }
     html += "</div>";
 
-    // ÖBB stations section
-    html += "<div class='card'><h2>S-Bahn / Zuege (OeBB)</h2>";
+    html += "<div class='card'><h2>S-Bahn / Züge (ÖBB)</h2>";
     if (cfgOebb.empty()) {
-        html += "<p class='status'>Noch keine OeBB-Linien konfiguriert.</p>";
+        html += "<p class='status'>Noch keine ÖBB-Linien konfiguriert.</p>";
     } else {
         for (size_t i = 0; i < cfgOebb.size(); i++) {
             auto& os = cfgOebb[i];
@@ -593,85 +700,78 @@ void handleRoot() {
     }
     html += "<form action='/oebb-search' method='GET'>";
     html += "<input type='text' name='q' placeholder='z.B. Wien Rennweg, Meidling...'>";
-    html += "<button class='add' type='submit'>OeBB-Station suchen</button>";
+    html += "<button class='add' type='submit'>ÖBB-Station suchen</button>";
     html += "</form></div>";
 
-    // Search form
     html += "<div class='card'><h2>Station suchen</h2>";
     html += "<form action='/search' method='GET'>";
     html += "<input type='text' name='q' placeholder='z.B. Kutschkergasse, Volksoper...' autofocus>";
     html += "<button type='submit'>Suchen</button>";
     html += "</form>";
-    html += "<a href='/browse'><button style='background:#0f3460;margin-top:6px'>Alle Stationen durchblaettern</button></a>";
+    html += "<a href='/browse'><button class='btn-info' style='margin-top:8px'>Alle Stationen durchblättern</button></a>";
     html += "</div>";
 
-    // Display settings
     html += "<div class='card'><h2>Einstellungen</h2>";
     html += "<form action='/settings' method='POST'>";
 
-    html += "<label style='font-size:13px;color:#aaa'>Seitenwechsel: <b id='v_rot' style='color:#eee'>" + String(cfgRotateSec) + " Sek</b></label>";
-    html += "<input type='range' name='rotate_sec' min='2' max='30' value='" + String(cfgRotateSec) + "' oninput=\"document.getElementById('v_rot').textContent=this.value+' Sek'\" style='width:100%;margin:8px 0'>";
+    html += "<div class='setting'><div class='setting-label'>Seitenwechsel <b id='v_rot'>" + String(cfgRotateSec) + " Sek</b></div>";
+    html += "<input type='range' name='rotate_sec' min='2' max='30' value='" + String(cfgRotateSec) + "' oninput=\"document.getElementById('v_rot').textContent=this.value+' Sek'\"></div>";
 
-    html += "<label style='font-size:13px;color:#aaa'>Helligkeit: <b id='v_bri' style='color:#eee'>" + String(cfgBrightness * 100 / 255) + "%</b></label>";
-    html += "<input type='range' name='brightness' min='10' max='255' value='" + String(cfgBrightness) + "' oninput=\"document.getElementById('v_bri').textContent=Math.round(this.value*100/255)+'%'\" style='width:100%;margin:8px 0'>";
+    html += "<div class='setting'><div class='setting-label'>Helligkeit <b id='v_bri'>" + String(cfgBrightness * 100 / 255) + "%</b></div>";
+    html += "<input type='range' name='brightness' min='10' max='255' value='" + String(cfgBrightness) + "' oninput=\"document.getElementById('v_bri').textContent=Math.round(this.value*100/255)+'%'\"></div>";
 
-    // Night mode
     String nightFromVal = (cfgNightFrom >= 0) ? String(cfgNightFrom) : "22";
     String nightToVal   = (cfgNightTo   >= 0) ? String(cfgNightTo)   : "7";
     String nightBrVal   = String(cfgNightBright * 100 / 255);
     bool nightOn = (cfgNightFrom >= 0);
-    html += "<div style='margin-top:12px'>";
-    html += "<label style='font-size:13px;color:#aaa'><input type='checkbox' name='night_on' value='1' id='cb_night'";
+    html += "<div class='setting'>";
+    html += "<label class='check-label'><input type='checkbox' name='night_on' value='1' id='cb_night'";
     if (nightOn) html += " checked";
-    html += " style='width:auto;margin-right:6px' onchange=\"document.getElementById('night_opts').style.display=this.checked?'block':'none'\">Nachtmodus</label></div>";
+    html += " onchange=\"document.getElementById('night_opts').style.display=this.checked?'block':'none'\">Nachtmodus</label></div>";
 
     html += "<div id='night_opts' style='display:";
     html += nightOn ? "block" : "none";
     html += "'>";
-    html += "<div style='display:flex;gap:8px;margin:8px 0;font-size:13px;color:#aaa;align-items:center'>";
-    html += "<span>Von</span><input type='number' name='night_from' min='0' max='23' value='" + nightFromVal + "' style='width:60px;padding:6px'>";
-    html += "<span>bis</span><input type='number' name='night_to' min='0' max='23' value='" + nightToVal + "' style='width:60px;padding:6px'><span>Uhr</span></div>";
-    html += "<label style='font-size:13px;color:#aaa'>Nacht-Helligkeit: <b id='v_nbri' style='color:#eee'>" + nightBrVal + "%</b></label>";
-    html += "<input type='range' name='night_bright' min='0' max='100' value='" + nightBrVal + "' oninput=\"document.getElementById('v_nbri').textContent=this.value+'%'\" style='width:100%;margin:8px 0'>";
+    html += "<div class='time-row'>";
+    html += "<span>Von</span><input type='number' name='night_from' min='0' max='23' value='" + nightFromVal + "'>";
+    html += "<span>bis</span><input type='number' name='night_to' min='0' max='23' value='" + nightToVal + "'><span>Uhr</span></div>";
+    html += "<div class='setting-label'>Nacht-Helligkeit <b id='v_nbri'>" + nightBrVal + "%</b></div>";
+    html += "<input type='range' name='night_bright' min='0' max='100' value='" + nightBrVal + "' oninput=\"document.getElementById('v_nbri').textContent=this.value+'%'\">";
     html += "</div>";
 
-    // Extra features
-    html += "<div style='margin-top:12px;display:flex;flex-direction:column;gap:8px'>";
-    html += "<label style='font-size:13px;color:#aaa'><input type='checkbox' name='show_next' value='1'";
+    html += "<div class='options-col'>";
+    html += "<label class='check-label'><input type='checkbox' name='show_next' value='1'";
     if (cfgShowNext) html += " checked";
-    html += " style='width:auto;margin-right:6px'>Naechste Abfahrt anzeigen <span style='color:#666'>(z.B. &gt;12 min)</span></label>";
-    html += "<label style='font-size:13px;color:#aaa'><input type='checkbox' name='show_disruptions' value='1'";
+    html += ">Nächste Abfahrt anzeigen</label>";
+    html += "<label class='check-label'><input type='checkbox' name='show_disruptions' value='1'";
     if (cfgShowDisruptions) html += " checked";
-    html += " style='width:auto;margin-right:6px'>Stoerungsticker anzeigen</label>";
+    html += ">Störungsticker anzeigen</label>";
     html += "</div>";
 
-    html += "<button type='submit' style='background:#555;margin-top:12px'>Speichern</button>";
+    html += "<button class='btn-secondary' type='submit' style='margin-top:14px'>Speichern</button>";
     html += "</form></div>";
 
-    // WiFi settings
     html += "<div class='card'><h2>WiFi</h2>";
-    html += "<p style='font-size:13px;color:#aaa;margin-bottom:8px'>Verbunden mit: <b style='color:#eee'>" + WiFi.SSID() + "</b></p>";
+    html += "<p class='info-text'>Verbunden mit: <b>" + WiFi.SSID() + "</b></p>";
+    html += "<p class='hint'>Nur 2,4 GHz Netzwerke werden unterstützt.</p>";
     html += "<form action='/wifi-reset' method='POST'>";
-    html += "<button style='background:#e67e22'>WLAN aendern</button>";
+    html += "<button class='btn-warn'>WLAN ändern</button>";
     html += "</form></div>";
 
-    // Factory reset
-    html += "<div class='card'><h2>Zuruecksetzen</h2>";
-    html += "<form action='/factory-reset' method='POST' onsubmit=\"return confirm('Wirklich alles loeschen? Alle Linien und Einstellungen gehen verloren.')\">";
-    html += "<button style='background:#c0392b'>Werksreset</button>";
+    html += "<div class='card'><h2>Zurücksetzen</h2>";
+    html += "<form action='/factory-reset' method='POST' onsubmit=\"return confirm('Wirklich alles löschen? Alle Linien und Einstellungen gehen verloren.')\">";
+    html += "<button class='btn-danger'>Werksreset</button>";
     html += "</form></div>";
 
-    // Firmware info + update
     html += "<div class='card'><h2>Firmware</h2>";
-    html += "<p style='font-size:13px;color:#aaa;margin-bottom:8px'>Version: <b style='color:#eee'>v" + String(FW_VERSION) + "</b></p>";
-    html += "<a href='/update'><button style='background:#0f3460'>Nach Update suchen</button></a>";
+    html += "<p class='info-text'>Version: <b>v" + String(FW_VERSION) + "</b></p>";
+    html += "<a href='/update'><button class='btn-info'>Nach Update suchen</button></a>";
     html += "</div>";
 
-    // Credits footer
-    html += "<div style='text-align:center;margin:20px 0 8px;font-size:11px;color:#555'>";
-    html += "<b style='color:#ffbf00'>LineTracker</b> by Leo Blum<br>";
-    html += "Daten: <a href='https://data.wien.gv.at' style='color:#666'>Stadt Wien &ndash; data.wien.gv.at</a> (CC BY 4.0)";
-    html += " &middot; <a href='https://fahrplan.oebb.at' style='color:#666'>OeBB/SCOTTY</a>";
+    html += "<div class='footer'>";
+    html += "<b>LineTracker</b> by Leo Blum<br>";
+    html += "Daten: <a href='https://data.wien.gv.at'>Stadt Wien &ndash; data.wien.gv.at</a> (CC BY 4.0)";
+    html += " &middot; <a href='https://fahrplan.oebb.at'>ÖBB/SCOTTY</a>";
     html += "</div>";
 
     html += "</body></html>";
@@ -686,115 +786,95 @@ void handleSearch() {
         return;
     }
 
-    tft.fillScreen(BG_COLOR);
-    tft.setTextColor(AMBER);
-    tft.setTextFont(1);
-    tft.setTextSize(2);
-    tft.setCursor(10, 70);
-    tft.print("Suche: " + query + "...");
-
     auto stations = searchStations(query);
 
     if (stations.empty()) {
         String html = FPSTR(HTML_HEAD);
-    
-        html += "<div class='card'><p class='status'>Keine Station gefunden fuer: " + query + "</p>";
-        html += "<a href='/'><button>Zurueck</button></a></div></body></html>";
+        html += "<div class='card'><p class='status'>Keine Station gefunden für:<br><b style='color:#e8e8f0'>" + query + "</b></p>";
+        html += "<p class='hint' style='text-align:center'>Tipp: Versuche einen kürzeren Suchbegriff oder <a href='/browse' style='color:#ffbf00'>blättere durch alle Stationen</a>.</p>";
+        html += "<a href='/'><button>Zurück</button></a></div></body></html>";
         server.send(200, "text/html", html);
         return;
     }
 
-    // Collect all steige info (RBL + line ID + direction) from cached CSVs
-    std::vector<SteigeInfo> allSteige;
-    String firstStationName = stations[0].second;
+    // Collect all lines from static data — no API call needed
+    struct SearchResult {
+        String rbl;
+        String lineName;
+        String towards;
+        String type;
+        String stopName;
+    };
+    std::vector<SearchResult> results;
+    std::map<String, bool> seenLineDir;
+
     for (auto& st : stations) {
         auto steige = findSteigeForStation(st.first);
-        for (auto& s : steige) {
-            bool dup = false;
-            for (auto& a : allSteige) { if (a.rbl == s.rbl) { dup = true; break; } }
-            if (!dup) allSteige.push_back(s);
+        for (auto& si : steige) {
+            // Look up line info from static directions map
+            auto it = lineDirMap.find(si.linienId);
+            String lineName, type, towards;
+            if (it != lineDirMap.end()) {
+                lineName = it->second.name;
+                type     = it->second.type;
+                towards  = (si.richtung == "H") ? it->second.terminusH : it->second.terminusR;
+            } else {
+                // Fallback to linien.csv lookup
+                if (!lookupLineInfo(si.linienId, lineName, type)) continue;
+                towards = (si.richtung == "H") ? "Richtung H" : "Richtung R";
+            }
+            if (towards.length() == 0) towards = (si.richtung == "H") ? "Richtung H" : "Richtung R";
+
+            // Deduplicate by line name + direction
+            String key = lineName + "|" + towards;
+            if (seenLineDir.find(key) != seenLineDir.end()) continue;
+            seenLineDir[key] = true;
+
+            SearchResult sr;
+            sr.rbl      = si.rbl;
+            sr.lineName = lineName;
+            sr.towards  = towards;
+            sr.type     = type;
+            sr.stopName = st.second;
+            results.push_back(sr);
         }
     }
 
-    // Split RBLs: cached (instant) vs uncached (need API probe)
-    std::vector<FoundLine> lines;
-    std::vector<String> uncachedRbls;
-
-    for (auto& si : allSteige) {
-        auto it = dirCache.find(si.rbl);
-        if (it != dirCache.end()) {
-            // Use cached direction info — no API call needed
-            bool dup = false;
-            for (auto& fl : lines) { if (fl.rbl == si.rbl) { dup = true; break; } }
-            if (!dup) lines.push_back(it->second);
-        } else {
-            uncachedRbls.push_back(si.rbl);
-        }
-    }
-
-    // Only probe uncached RBLs via realtime API
-    if (!uncachedRbls.empty()) {
-        tft.fillScreen(BG_COLOR);
-        tft.setCursor(10, 70);
-        tft.print("Lade Linien...");
-
-        auto probed = probeRbls(uncachedRbls);
-        for (auto& fl : probed) {
-            bool dup = false;
-            for (auto& l : lines) { if (l.rbl == fl.rbl) { dup = true; break; } }
-            if (!dup) lines.push_back(fl);
-        }
-    }
-
-    // Find RBLs still missing (not cached AND not in probe) — use CSV fallback
-    for (auto& si : allSteige) {
-        bool found = false;
-        for (auto& fl : lines) { if (fl.rbl == si.rbl) { found = true; break; } }
-        if (found) continue;
-
-        // Look up line name and type from linien CSV
-        String lineName, lineType;
-        if (lookupLineInfo(si.linienId, lineName, lineType)) {
-            FoundLine fl;
-            fl.rbl = si.rbl;
-            fl.lineName = lineName;
-            fl.towards = (si.richtung == "H") ? "Richtung A" : "Richtung B";
-            fl.type = lineType;
-            fl.stopName = firstStationName + " (faehrt gerade nicht)";
-            lines.push_back(fl);
-        }
-    }
+    // Sort by transport type: U-Bahn → Tram → Bus → Train → other
+    std::sort(results.begin(), results.end(), [](const SearchResult& a, const SearchResult& b) {
+        int pa = transportPriority(a.type), pb = transportPriority(b.type);
+        if (pa != pb) return pa < pb;
+        return a.lineName < b.lineName;
+    });
 
     String html = FPSTR(HTML_HEAD);
-
     html += "<div class='card'><h2>Ergebnisse: " + query + "</h2>";
 
-    if (lines.empty()) {
+    if (results.empty()) {
         html += "<p class='status'>Keine Linien gefunden</p>";
     } else {
         html += "<form action='/save' method='POST'>";
-        for (size_t i = 0; i < lines.size(); i++) {
-            auto& fl = lines[i];
+        for (size_t i = 0; i < results.size(); i++) {
+            auto& sr = results[i];
             bool alreadyActive = false;
             for (auto& cl : cfgLines) {
-                if (cl.rbl == fl.rbl) { alreadyActive = true; break; }
+                if (cl.rbl == sr.rbl) { alreadyActive = true; break; }
             }
 
-            String val = fl.rbl + "|" + fl.lineName + "|" + fl.towards + "|" + fl.type;
+            String val = sr.rbl + "|" + sr.lineName + "|" + sr.towards + "|" + sr.type;
             html += "<div class='line-item'>";
             html += "<input type='checkbox' name='line' value='" + val + "'";
             if (alreadyActive) html += " checked disabled";
             html += ">";
-            html += "<span class='" + badgeClassForType(fl.type) + "'>" + fl.lineName + "</span>";
-            html += "<div><div class='dir'>" + fl.towards + "</div>";
-            html += "<div class='stop'>" + fl.stopName + "</div></div>";
+            html += "<span class='" + badgeClassForType(sr.type) + "'>" + sr.lineName + "</span>";
+            html += "<div class='dir'>" + sr.towards + "</div>";
             html += "</div>";
         }
-        html += "<button class='add' type='submit'>Ausgewaehlte hinzufuegen</button>";
+        html += "<button class='add' type='submit'>Ausgewählte hinzufügen</button>";
         html += "</form>";
     }
 
-    html += "<br><a href='/'><button>Zurueck</button></a></div></body></html>";
+    html += "<br><a href='/'><button>Zurück</button></a></div></body></html>";
     server.send(200, "text/html", html);
 }
 
@@ -910,8 +990,8 @@ void handleOebbSearch() {
     if (stationName.length() == 0) {
         String html = FPSTR(HTML_HEAD);
     
-        html += "<div class='card'><p class='status'>OeBB-Station nicht gefunden: " + query + "</p>";
-        html += "<a href='/'><button>Zurueck</button></a></div></body></html>";
+        html += "<div class='card'><p class='status'>ÖBB-Station nicht gefunden: " + query + "</p>";
+        html += "<a href='/'><button>Zurück</button></a></div></body></html>";
         server.send(200, "text/html", html);
         return;
     }
@@ -960,11 +1040,11 @@ void handleOebbSearch() {
             html += "<div class='dir'>" + c.second + "</div>";
             html += "</div>";
         }
-        html += "<button class='add' type='submit'>Ausgewaehlte hinzufuegen</button>";
+        html += "<button class='add' type='submit'>Ausgewählte hinzufügen</button>";
         html += "</form>";
     }
 
-    html += "<br><a href='/'><button>Zurueck</button></a></div></body></html>";
+    html += "<br><a href='/'><button>Zurück</button></a></div></body></html>";
     server.send(200, "text/html", html);
 }
 
@@ -1031,8 +1111,7 @@ void handleBrowse() {
     }
     html += "</div>";
 
-    if (letter.length() == 1) {
-        // Read from cached haltestellen CSV
+    if (letter.length() >= 1) {
         File f = SPIFFS.open(CACHE_HALT_PATH, "r");
 
         if (f) {
@@ -1053,9 +1132,11 @@ void handleBrowse() {
                 name.replace("\"", "");
                 if (name.length() == 0) continue;
 
-                String firstChar = name.substring(0, 1);
-                firstChar.toUpperCase();
-                if (firstChar != letter) continue;
+                // Map Umlauts to base letter for browse matching
+                String normalized = normalizeForSearch(name.substring(0, 2));  // first char (UTF-8 may be 2 bytes)
+                String firstNorm = normalized.substring(0, 1);
+                firstNorm.toUpperCase();
+                if (firstNorm != letter) continue;
 
                 if (seen.find(name) != seen.end()) continue;
                 seen[name] = true;
@@ -1068,7 +1149,7 @@ void handleBrowse() {
             if (names.empty()) {
                 html += "<p class='status'>Keine Stationen mit " + letter + "</p>";
             } else {
-                html += "<p style='color:#888;font-size:12px;margin:4px 0'>" + String(names.size()) + " Stationen</p>";
+                html += "<p class='stn-count'>" + String(names.size()) + " Stationen</p>";
                 for (auto& n : names) {
                     String encoded = n;
                     encoded.replace(" ", "+");
@@ -1076,13 +1157,13 @@ void handleBrowse() {
                 }
             }
         } else {
-            html += "<p class='status'>Stationsdaten nicht verfuegbar. Bitte neu starten.</p>";
+            html += "<p class='status'>Stationsdaten nicht verfügbar. Bitte neu starten.</p>";
         }
     } else {
-        html += "<p class='status'>Waehle einen Buchstaben</p>";
+        html += "<p class='status'>Wähle einen Buchstaben</p>";
     }
 
-    html += "<br><a href='/'><button>Zurueck</button></a></div></body></html>";
+    html += "<br><a href='/'><button>Zurück</button></a></div></body></html>";
     server.send(200, "text/html", html);
 }
 
@@ -1092,34 +1173,31 @@ void handleWifiReset() {
     if (f) { f.print("1"); f.close(); }
 
     String html = FPSTR(HTML_HEAD);
-    html += "<h1>WiFi Reset</h1>";
-    html += "<div class='card'><p class='status'>Monitor startet neu...<br><br>";
+    html += "<div class='card'><h2>WiFi Reset</h2><p class='status'>Monitor startet neu...<br><br>";
     html += "Verbinde dich mit:<br><b style='color:#ffbf00;font-size:1.3em'>LineTracker</b><br><br>";
-    html += "Waehle dein WLAN, dann oeffne:<br><b style='color:#ffbf00'>linetracker.local</b></p></div></body></html>";
+    html += "Wähle dein WLAN, dann öffne:<br><b style='color:#ffbf00'>linetracker.local</b></p></div></body></html>";
     server.send(200, "text/html", html);
     delay(1500);
     ESP.restart();
 }
 
 void handleFactoryReset() {
-    // Erase config, caches, direction cache
     SPIFFS.remove(CONFIG_PATH);
     SPIFFS.remove(DIR_CACHE_PATH);
+    SPIFFS.remove(LINE_DIRS_PATH);
     SPIFFS.remove(CACHE_HALT_PATH);
     SPIFFS.remove(CACHE_STEIGE_PATH);
     SPIFFS.remove(CACHE_LINIEN_PATH);
     SPIFFS.remove(CACHE_TS_PATH);
 
-    // Reset WiFi credentials
     WiFiManager wm;
     wm.resetSettings();
 
     String html = FPSTR(HTML_HEAD);
-    html += "<h1>Werksreset</h1>";
-    html += "<div class='card'><p class='status'>Alles geloescht!<br><br>";
+    html += "<div class='card'><h2>Werksreset</h2><p class='status'>Alles gelöscht!<br><br>";
     html += "Monitor startet neu...<br><br>";
     html += "Verbinde dich mit:<br><b style='color:#ffbf00;font-size:1.3em'>LineTracker</b><br><br>";
-    html += "Waehle dein WLAN, dann oeffne:<br><b style='color:#ffbf00'>linetracker.local</b></p></div></body></html>";
+    html += "Wähle dein WLAN, dann öffne:<br><b style='color:#ffbf00'>linetracker.local</b></p></div></body></html>";
     server.send(200, "text/html", html);
     delay(1500);
     ESP.restart();
@@ -1273,13 +1351,13 @@ void handleOtaCheck() {
     if (remoteVer.length() == 0) {
         html += "<p class='status'>Updateserver nicht erreichbar.</p>";
     } else if (isNewerVersion(remoteVer, FW_VERSION)) {
-        html += "<p style='text-align:center;color:#1a8f3c;font-size:16px;font-weight:600;margin:12px 0'>v" + remoteVer + " verfuegbar!</p>";
+        html += "<p style='text-align:center;color:#1a8f3c;font-size:16px;font-weight:600;margin:12px 0'>v" + remoteVer + " verfügbar!</p>";
         html += "<a href='/update-now'><button class='add'>Jetzt updaten</button></a>";
     } else {
         html += "<p class='status'>Firmware ist aktuell.</p>";
     }
 
-    html += "<br><a href='/'><button style='background:#555'>Zurueck</button></a>";
+    html += "<br><a href='/'><button class='btn-secondary'>Zurück</button></a>";
     html += "</div></body></html>";
     server.send(200, "text/html", html);
 }
@@ -1358,23 +1436,23 @@ void showWifiSetupScreen(const char* subtitle) {
     tft.setTextColor(AMBER, BG_COLOR);
     tft.setTextSize(2);
     const char* s1 = "1) WLAN verbinden:";
-    tft.setCursor((320 - tft.textWidth(s1)) / 2, 60);
+    tft.setCursor((320 - tft.textWidth(s1)) / 2, 56);
     tft.print(s1);
 
     tft.setTextColor(tft.color565(255, 220, 60), BG_COLOR);
     const char* ap = "\"LineTracker\"";
-    tft.setCursor((320 - tft.textWidth(ap)) / 2, 82);
+    tft.setCursor((320 - tft.textWidth(ap)) / 2, 76);
     tft.print(ap);
 
     tft.setTextColor(AMBER, BG_COLOR);
     const char* s2 = "2) Netzwerk waehlen";
-    tft.setCursor((320 - tft.textWidth(s2)) / 2, 108);
+    tft.setCursor((320 - tft.textWidth(s2)) / 2, 100);
     tft.print(s2);
 
     tft.setTextColor(AMBER_DIM, BG_COLOR);
     tft.setTextSize(1);
-    const char* hint = "Timeout: 3 Min";
-    tft.setCursor((320 - tft.textWidth(hint)) / 2, 140);
+    const char* hint = "Nur 2.4 GHz | Timeout: 3 Min";
+    tft.setCursor((320 - tft.textWidth(hint)) / 2, 128);
     tft.print(hint);
 
     // Attribution
@@ -1385,18 +1463,23 @@ void showWifiSetupScreen(const char* subtitle) {
 }
 
 void setupWiFi() {
+    // Force 2.4 GHz and maximize compatibility
+    WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+    WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+
     WiFiManager wm;
+    wm.setConnectRetries(3);              // retry connection up to 3 times
+    wm.setMinimumSignalQuality(10);       // accept weak signals
+
     bool wifiResetRequested = SPIFFS.exists(WIFI_RESET_FLAG);
     if (wifiResetRequested) {
         SPIFFS.remove(WIFI_RESET_FLAG);
     }
 
     if (wifiResetRequested) {
-        // User requested WiFi change — show setup screen immediately
-        showWifiSetupScreen("WLAN aendern");
+        showWifiSetupScreen("WLAN ändern");
         wm.setConfigPortalTimeout(180);
         if (!wm.startConfigPortal("LineTracker")) {
-            // Timeout — try old credentials
             tft.fillRect(0, 135, 320, 25, BG_COLOR);
             tft.setTextColor(AMBER_DIM, BG_COLOR);
             tft.setTextFont(1);
@@ -1406,7 +1489,7 @@ void setupWiFi() {
             tft.print(msg);
             WiFi.begin();
             unsigned long start = millis();
-            while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+            while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
                 delay(500);
             }
             if (WiFi.status() != WL_CONNECTED) {
@@ -1414,11 +1497,10 @@ void setupWiFi() {
             }
         }
     } else {
-        // Normal startup — try auto-connect, show portal if no saved WiFi
         wm.setAPCallback([](WiFiManager* mgr) {
             showWifiSetupScreen("Ersteinrichtung");
         });
-        wm.setConnectTimeout(5);          // only wait 5s for saved WiFi
+        wm.setConnectTimeout(15);         // 15s for saved WiFi (was 5s)
         wm.setSaveConnectTimeout(30);     // wait 30s when user submits credentials in portal
         wm.setConfigPortalTimeout(180);
         if (!wm.autoConnect("LineTracker")) {
@@ -2128,22 +2210,28 @@ void dataTask(void* param) {
     unsigned long lastCacheRefresh = millis();
     unsigned long lastOtaCheck = millis();
     for (;;) {
-        // Auto-reconnect WiFi if disconnected
+        // Auto-reconnect WiFi if disconnected (with retries)
         if (WiFi.status() != WL_CONNECTED) {
             Serial.println("WiFi lost, reconnecting...");
-            WiFi.disconnect();
-            WiFi.begin();  // uses stored NVS credentials
-            int retries = 0;
-            while (WiFi.status() != WL_CONNECTED && retries < 30) {
+            for (int attempt = 0; attempt < 3; attempt++) {
+                WiFi.disconnect();
                 vTaskDelay(pdMS_TO_TICKS(1000));
-                retries++;
+                WiFi.begin();
+                int retries = 0;
+                while (WiFi.status() != WL_CONNECTED && retries < 15) {
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    retries++;
+                }
+                if (WiFi.status() == WL_CONNECTED) {
+                    Serial.println("WiFi reconnected: " + WiFi.localIP().toString());
+                    MDNS.begin("linetracker");
+                    MDNS.addService("http", "tcp", 80);
+                    break;
+                }
+                Serial.printf("WiFi reconnect attempt %d failed\n", attempt + 1);
             }
-            if (WiFi.status() == WL_CONNECTED) {
-                Serial.println("WiFi reconnected: " + WiFi.localIP().toString());
-                MDNS.begin("linetracker");
-                MDNS.addService("http", "tcp", 80);
-            } else {
-                Serial.println("WiFi reconnect failed, will retry next cycle");
+            if (WiFi.status() != WL_CONNECTED) {
+                Serial.println("WiFi reconnect failed after 3 attempts, will retry next cycle");
             }
         }
         fetchDepartures();
@@ -2303,6 +2391,7 @@ void setup() {
 
     loadConfig();
     loadDirCache();
+    loadLineDirections();
     ledcWrite(0, cfgBrightness);
 
     // Show loading status below splash
@@ -2345,6 +2434,10 @@ void setup() {
     tft.setCursor((320 - tft.textWidth("Lade Stationsdaten...")) / 2, 140);
     tft.print("Lade Stationsdaten...");
     refreshCsvCache();
+    // Ensure line directions exist (build if missing, e.g. after OTA update)
+    if (lineDirMap.empty() && SPIFFS.exists(CACHE_STEIGE_PATH)) {
+        buildLineDirections();
+    }
 
     Serial.print("WL Lines: "); Serial.println(cfgLines.size());
     Serial.print("OeBB Stations: "); Serial.println(cfgOebb.size());
