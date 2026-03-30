@@ -15,7 +15,7 @@
 #include <time.h>
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.1.3"
+#define FW_VERSION "1.1.4"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -2515,11 +2515,7 @@ void setup() {
 
     loadConfig();
     if (cfgHostname.length() == 0) {
-        uint8_t mac[6];
-        WiFi.macAddress(mac);
-        char suffix[5];
-        snprintf(suffix, sizeof(suffix), "%02x%02x", mac[4], mac[5]);
-        cfgHostname = "linetracker-" + String(suffix);
+        cfgHostname = "linetracker";
         saveConfig();
     }
     loadDirCache();
@@ -2534,8 +2530,34 @@ void setup() {
 
     setupWiFi();
 
-    // Give the WiFi stack a moment to fully stabilize before starting mDNS
+    // Give the WiFi stack a moment to fully stabilize before mDNS check
     delay(500);
+
+    // Detect hostname conflict: check if linetracker.local is already in use by
+    // another device. If so, assign a unique MAC-based name. If no conflict and
+    // we previously had a MAC-based name, revert to "linetracker".
+    {
+        IPAddress resolved;
+        bool conflict = WiFi.hostByName("linetracker.local", resolved)
+                        && resolved != WiFi.localIP()
+                        && resolved != IPAddress(0, 0, 0, 0);
+        if (conflict) {
+            uint8_t mac[6];
+            WiFi.macAddress(mac);
+            char suffix[5];
+            snprintf(suffix, sizeof(suffix), "%02x%02x", mac[4], mac[5]);
+            String uniqueName = "linetracker-" + String(suffix);
+            if (cfgHostname != uniqueName) {
+                cfgHostname = uniqueName;
+                saveConfig();
+                Serial.println("Hostname conflict — using: " + cfgHostname);
+            }
+        } else if (cfgHostname != "linetracker") {
+            // No conflict — revert to default if we had a MAC-based name
+            cfgHostname = "linetracker";
+            saveConfig();
+        }
+    }
 
     // Start mDNS + web server immediately so user can access UI
     if (MDNS.begin(cfgHostname.c_str())) {
@@ -2544,6 +2566,19 @@ void setup() {
     }
     Serial.println("Connected! IP: " + WiFi.localIP().toString());
     startConfigServer();
+
+    // Briefly show assigned hostname on splash so user always knows the URL
+    {
+        String urlStr = "http://" + cfgHostname + ".local";
+        tft.fillRect(0, 130, 320, 40, BG_COLOR);
+        tft.setTextFont(1);
+        tft.setTextColor(AMBER, BG_COLOR);
+        tft.setTextSize(2);
+        int uw = tft.textWidth(urlStr);
+        tft.setCursor((320 - uw) / 2, 138);
+        tft.print(urlStr);
+        delay(3000);
+    }
 
     // Start display task immediately so setup screen with IP shows
     dataMutex = xSemaphoreCreateMutex();
