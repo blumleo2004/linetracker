@@ -12,6 +12,7 @@
 #include <HTTPUpdate.h>
 #include <vector>
 #include <map>
+#include <algorithm>
 #include <time.h>
 
 // ── In-memory log ring buffer (accessible via /logs) ─────────────────
@@ -47,7 +48,7 @@ String getLogContents() {
 }
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.1.5"
+#define FW_VERSION "1.1.6"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -82,7 +83,7 @@ struct FoundLine {
 
 // Direction cache: RBL → line name, towards, type
 static const char* DIR_CACHE_PATH = "/dir_cache.json";
-static std::map<String, FoundLine> dirCache;  // in-memory, periodically saved
+static std::map<String, std::vector<FoundLine>> dirCache;  // rbl → all lines (multi-line RBLs)
 
 // Static line directions: linienId → {name, type, terminusH, terminusR}
 static const char* LINE_DIRS_PATH = "/line_dirs.json";
@@ -94,6 +95,21 @@ struct LineDirInfo {
 };
 static std::map<String, LineDirInfo> lineDirMap;  // linienId → info
 
+// Steige CSV entry (defined here so search index types are available globally)
+struct SteigeInfo {
+    String rbl;
+    String linienId;
+    String richtung;  // "H" or "R"
+};
+
+// PSRAM-backed search indexes — char arrays keep small allocations out of internal heap
+struct HaltRecord   { char haltId[12]; char name[64]; };
+struct SteigeRecord { char haltId[12]; char rbl[8]; char linienId[12]; char richtung; char _pad[3]; };
+static HaltRecord*   haltRecords        = nullptr;
+static int           haltRecordCount    = 0;
+static SteigeRecord* steigeRecords      = nullptr;
+static int           steigeRecordCount  = 0;
+
 void loadDirCache() {
     if (!SPIFFS.exists(DIR_CACHE_PATH)) return;
     File f = SPIFFS.open(DIR_CACHE_PATH, "r");
@@ -102,27 +118,27 @@ void loadDirCache() {
     if (deserializeJson(doc, f)) { f.close(); return; }
     f.close();
     for (JsonPair kv : doc.as<JsonObject>()) {
-        FoundLine fl;
-        fl.rbl      = kv.key().c_str();
-        fl.lineName = kv.value()["n"] | "";
-        fl.towards  = kv.value()["t"] | "";
-        fl.type     = kv.value()["y"] | "";
-        fl.stopName = kv.value()["s"] | "";
-        if (fl.rbl.length() > 0 && fl.lineName.length() > 0) {
-            dirCache[fl.rbl] = fl;
+        String rbl = kv.key().c_str();
+        for (JsonObject obj : kv.value().as<JsonArray>()) {
+            FoundLine fl;
+            fl.rbl = rbl; fl.lineName = obj["n"] | ""; fl.towards = obj["t"] | "";
+            fl.type = obj["y"] | ""; fl.stopName = obj["s"] | "";
+            if (fl.lineName.length() > 0) dirCache[rbl].push_back(fl);
         }
     }
-    Serial.printf("Direction cache loaded: %d entries\n", dirCache.size());
+    int total = 0; for (auto& kv2 : dirCache) total += kv2.second.size();
+    Serial.printf("Direction cache loaded: %d RBLs, %d lines\n", dirCache.size(), total);
 }
 
 void saveDirCache() {
     JsonDocument doc;
     for (auto& pair : dirCache) {
-        JsonObject obj = doc[pair.first].to<JsonObject>();
-        obj["n"] = pair.second.lineName;
-        obj["t"] = pair.second.towards;
-        obj["y"] = pair.second.type;
-        obj["s"] = pair.second.stopName;
+        JsonArray arr = doc[pair.first].to<JsonArray>();
+        for (auto& fl : pair.second) {
+            JsonObject obj = arr.add<JsonObject>();
+            obj["n"] = fl.lineName; obj["t"] = fl.towards;
+            obj["y"] = fl.type;    obj["s"] = fl.stopName;
+        }
     }
     File f = SPIFFS.open(DIR_CACHE_PATH, "w");
     if (!f) return;
@@ -131,9 +147,11 @@ void saveDirCache() {
 }
 
 void cacheDirEntry(const String& rbl, const String& name, const String& towards, const String& type, const String& stop) {
+    auto& vec = dirCache[rbl];
+    for (auto& fl : vec) { if (fl.lineName == name && fl.towards == towards) return; }
     FoundLine fl;
     fl.rbl = rbl; fl.lineName = name; fl.towards = towards; fl.type = type; fl.stopName = stop;
-    dirCache[rbl] = fl;
+    vec.push_back(fl);
 }
 
 void loadLineDirections() {
@@ -340,7 +358,8 @@ void saveCacheTimestamp() {
 }
 
 void buildLineDirections() {
-    logf("Building line directions...\n");
+    logf("Building line directions... heap=%u psram=%u\n",
+         ESP.getFreeHeap(), ESP.getFreePsram());
 
     // Step 1: Load all line info from linien.csv
     std::map<String, std::pair<String,String>> lineInfoMap; // id → {name, type}
@@ -367,9 +386,16 @@ void buildLineDirections() {
     struct TermInfo { int maxH = -1; String haltH; int maxR = -1; String haltR; };
     std::map<String, TermInfo> termMap;
     {
+        const int MAX_STEIGE = 10000;
+        if (steigeRecords) { free(steigeRecords); steigeRecords = nullptr; steigeRecordCount = 0; }
+        steigeRecords = (SteigeRecord*)ps_malloc(MAX_STEIGE * sizeof(SteigeRecord));
+        if (!steigeRecords) logf("[buildLD] WARN: ps_malloc steigeRecords failed\n");
+
         File f = SPIFFS.open(CACHE_STEIGE_PATH, "r");
         if (!f) { logf("steige.csv not found\n"); return; }
+        int yieldCounter = 0;
         while (f.available()) {
+            if (++yieldCounter % 200 == 0) vTaskDelay(pdMS_TO_TICKS(1));
             String line = f.readStringUntil('\n');
             int s1 = line.indexOf(';'); if (s1 < 0) continue;
             int s2 = line.indexOf(';', s1 + 1); if (s2 < 0) continue;
@@ -384,16 +410,45 @@ void buildLineDirections() {
             auto& ti = termMap[linienId];
             if (richtung == "H" && seq > ti.maxH) { ti.maxH = seq; ti.haltH = haltId; }
             else if (richtung == "R" && seq > ti.maxR) { ti.maxR = seq; ti.haltR = haltId; }
+            // Fill steigeRecords (deduplicated via sort+unique after scan)
+            int s6 = line.indexOf(';', s5 + 1);
+            if (s6 >= 0 && steigeRecords && steigeRecordCount < MAX_STEIGE) {
+                String rbl = line.substring(s5 + 1, s6); rbl.replace("\"", ""); rbl.trim();
+                if (rbl.length() > 0) {
+                    auto& r = steigeRecords[steigeRecordCount++];
+                    strncpy(r.haltId,   haltId.c_str(),   11); r.haltId[11]   = '\0';
+                    strncpy(r.rbl,      rbl.c_str(),        7); r.rbl[7]       = '\0';
+                    strncpy(r.linienId, linienId.c_str(),  11); r.linienId[11] = '\0';
+                    r.richtung = (richtung == "H") ? 'H' : 'R';
+                }
+            }
         }
         f.close();
+        if (steigeRecords && steigeRecordCount > 0) {
+            std::sort(steigeRecords, steigeRecords + steigeRecordCount, [](const SteigeRecord& a, const SteigeRecord& b) {
+                int c = strcmp(a.haltId, b.haltId); if (c != 0) return c < 0;
+                c = strcmp(a.rbl, b.rbl); if (c != 0) return c < 0;
+                return strcmp(a.linienId, b.linienId) < 0;
+            });
+            auto endIt = std::unique(steigeRecords, steigeRecords + steigeRecordCount, [](const SteigeRecord& a, const SteigeRecord& b) {
+                return strcmp(a.haltId, b.haltId) == 0 && strcmp(a.rbl, b.rbl) == 0 && strcmp(a.linienId, b.linienId) == 0;
+            });
+            steigeRecordCount = endIt - steigeRecords;
+        }
+        logf("[buildLD] steige scan done: %d records, heap=%u psram=%u\n",
+             steigeRecordCount, ESP.getFreeHeap(), ESP.getFreePsram());
     }
 
-    // Step 3: Collect needed haltIds and resolve from halt.csv
+    // Step 3: Scan full halt.csv — resolve terminus names AND build search index
     std::map<String, String> haltNames;
     for (auto& p : termMap) {
         if (p.second.haltH.length() > 0) haltNames[p.second.haltH] = "";
         if (p.second.haltR.length() > 0) haltNames[p.second.haltR] = "";
     }
+    const int MAX_HALT = 2200;
+    if (haltRecords) { free(haltRecords); haltRecords = nullptr; haltRecordCount = 0; }
+    haltRecords = (HaltRecord*)ps_malloc(MAX_HALT * sizeof(HaltRecord));
+    if (!haltRecords) logf("[buildLD] WARN: ps_malloc haltRecords failed\n");
     {
         File f = SPIFFS.open(CACHE_HALT_PATH, "r");
         if (!f) { logf("halt.csv not found\n"); return; }
@@ -401,12 +456,18 @@ void buildLineDirections() {
             String line = f.readStringUntil('\n');
             int s1 = line.indexOf(';'); if (s1 < 0) continue;
             String haltId = line.substring(0, s1); haltId.replace("\"", "");
-            if (haltNames.find(haltId) == haltNames.end()) continue;
             int s2 = line.indexOf(';', s1 + 1); if (s2 < 0) continue;
             int s3 = line.indexOf(';', s2 + 1); if (s3 < 0) continue;
             int s4 = line.indexOf(';', s3 + 1); if (s4 < 0) continue;
             String name = line.substring(s3 + 1, s4); name.replace("\"", "");
-            haltNames[haltId] = name;
+            if (name.length() == 0) continue;
+            auto it = haltNames.find(haltId);
+            if (it != haltNames.end()) it->second = name;
+            if (haltRecords && haltRecordCount < MAX_HALT) {
+                auto& r = haltRecords[haltRecordCount++];
+                strncpy(r.haltId, haltId.c_str(), 11); r.haltId[11] = '\0';
+                strncpy(r.name,   name.c_str(),   63); r.name[63]   = '\0';
+            }
         }
         f.close();
     }
@@ -428,7 +489,8 @@ void buildLineDirections() {
         File f = SPIFFS.open(LINE_DIRS_PATH, "w");
         if (f) { serializeJson(doc, f); f.close(); }
     }
-    logf("Line directions built: %d lines\n", count);
+    logf("Line directions built: %d lines, halt index: %d, steige index: %d, heap=%u psram=%u\n",
+         count, haltRecordCount, steigeRecordCount, ESP.getFreeHeap(), ESP.getFreePsram());
 
     // Reload into memory
     loadLineDirections();
@@ -515,12 +577,27 @@ int transportPriority(const String& type) {
 std::vector<std::pair<String,String>> searchStations(const String& query) {
     std::vector<std::pair<String,String>> results;
 
-    File f = SPIFFS.open(CACHE_HALT_PATH, "r");
-    if (!f) return results;
-
     String lowerQuery = query;
     lowerQuery.toLowerCase();
     String normQuery = normalizeForSearch(query);
+
+    // Fast path: use pre-built PSRAM index (built during buildLineDirections)
+    if (haltRecords && haltRecordCount > 0) {
+        for (int i = 0; i < haltRecordCount; i++) {
+            String name = String(haltRecords[i].name);
+            String lowerName = name; lowerName.toLowerCase();
+            String normName = normalizeForSearch(name);
+            if (lowerName.indexOf(lowerQuery) >= 0 || normName.indexOf(normQuery) >= 0) {
+                results.push_back({String(haltRecords[i].haltId), name});
+                if (results.size() >= 15) break;
+            }
+        }
+        return results;
+    }
+
+    // Slow fallback: scan halt.csv (used before buildLineDirections completes)
+    File f = SPIFFS.open(CACHE_HALT_PATH, "r");
+    if (!f) return results;
 
     while (f.available()) {
         String line = f.readStringUntil('\n');
@@ -554,13 +631,6 @@ std::vector<std::pair<String,String>> searchStations(const String& query) {
     f.close();
     return results;
 }
-
-// Steige CSV: "STEIG_ID";"FK_LINIEN_ID";"FK_HALTESTELLEN_ID";"RICHTUNG";"REIHENFOLGE";"RBL_NUMMER";...
-struct SteigeInfo {
-    String rbl;
-    String linienId;
-    String richtung;  // "H" or "R"
-};
 
 // Find all RBLs (with line IDs) for a given station ID from cached steige CSV
 std::vector<SteigeInfo> findSteigeForStation(const String& haltId) {
@@ -604,7 +674,7 @@ std::vector<SteigeInfo> findSteigeForStation(const String& haltId) {
 
         if (rbl.length() > 0) {
             bool dup = false;
-            for (auto& r : results) { if (r.rbl == rbl) { dup = true; break; } }
+            for (auto& r : results) { if (r.rbl == rbl && r.linienId == linienId) { dup = true; break; } }
             if (!dup) results.push_back({rbl, linienId, richtung});
         }
     }
@@ -615,10 +685,33 @@ std::vector<SteigeInfo> findSteigeForStation(const String& haltId) {
 // Read steige.csv once for multiple station IDs simultaneously
 std::map<String, std::vector<SteigeInfo>> findSteigeForStations(const std::vector<String>& haltIds) {
     std::map<String, std::vector<SteigeInfo>> results;
+    // Fast path: PSRAM sorted array + binary search
+    if (steigeRecords && steigeRecordCount > 0) {
+        for (auto& id : haltIds) {
+            SteigeRecord key; strncpy(key.haltId, id.c_str(), 11); key.haltId[11] = '\0';
+            auto lo = std::lower_bound(steigeRecords, steigeRecords + steigeRecordCount, key,
+                [](const SteigeRecord& a, const SteigeRecord& b) { return strcmp(a.haltId, b.haltId) < 0; });
+            auto& vec = results[id];
+            while (lo < steigeRecords + steigeRecordCount && strcmp(lo->haltId, key.haltId) == 0) {
+                vec.push_back({String(lo->rbl), String(lo->linienId), lo->richtung == 'H' ? "H" : "R"});
+                ++lo;
+            }
+        }
+        return results;
+    }
+
+    // Slow fallback: scan steige.csv
+    unsigned long t0 = millis();
     File f = SPIFFS.open(CACHE_STEIGE_PATH, "r");
     if (!f) return results;
+    int linesRead = 0, linesMatched = 0;
     while (f.available()) {
         String line = f.readStringUntil('\n');
+        linesRead++;
+        // Quick pre-filter: skip lines that don't contain any of the halt IDs
+        bool preMatch = false;
+        for (auto& id : haltIds) { if (line.indexOf(id) >= 0) { preMatch = true; break; } }
+        if (!preMatch) continue;
         int s1 = line.indexOf(';'); if (s1 < 0) continue;
         int s2 = line.indexOf(';', s1 + 1); if (s2 < 0) continue;
         int s3 = line.indexOf(';', s2 + 1); if (s3 < 0) continue;
@@ -627,6 +720,7 @@ std::map<String, std::vector<SteigeInfo>> findSteigeForStations(const std::vecto
         bool matched = false;
         for (auto& id : haltIds) { if (foundHalt == id) { matched = true; break; } }
         if (!matched) continue;
+        linesMatched++;
         int s4 = line.indexOf(';', s3 + 1); if (s4 < 0) continue;
         String richtung = line.substring(s3 + 1, s4); richtung.replace("\"", "");
         int s5 = line.indexOf(';', s4 + 1); if (s5 < 0) continue;
@@ -636,11 +730,12 @@ std::map<String, std::vector<SteigeInfo>> findSteigeForStations(const std::vecto
         if (rbl.length() > 0) {
             auto& vec = results[foundHalt];
             bool dup = false;
-            for (auto& r : vec) { if (r.rbl == rbl) { dup = true; break; } }
+            for (auto& r : vec) { if (r.rbl == rbl && r.linienId == linienId) { dup = true; break; } }
             if (!dup) vec.push_back({rbl, linienId, richtung});
         }
     }
     f.close();
+    logf("[steige] %lums, %d lines read, %d matched\n", millis()-t0, linesRead, linesMatched);
     return results;
 }
 
@@ -962,7 +1057,7 @@ void handleSearch() {
     for (auto& kv : steigeByHalt)
         for (auto& s : kv.second) {
             bool dup = false;
-            for (auto& a : allSteige) { if (a.rbl == s.rbl) { dup = true; break; } }
+            for (auto& a : allSteige) { if (a.rbl == s.rbl && a.linienId == s.linienId) { dup = true; break; } }
             if (!dup) allSteige.push_back(s);
         }
     logf("[search] steige scan: %lums, rbls: %d\n", millis()-t1, allSteige.size());
@@ -973,10 +1068,12 @@ void handleSearch() {
     for (auto& si : allSteige) {
         auto it = dirCache.find(si.rbl);
         if (it != dirCache.end()) {
-            String key = it->second.lineName + "|" + it->second.towards;
-            if (seenLineDir.find(key) == seenLineDir.end()) {
-                seenLineDir[key] = true;
-                results.push_back({si.rbl, it->second.lineName, it->second.towards, it->second.type});
+            for (auto& fl : it->second) {
+                String key = fl.lineName + "|" + si.richtung;
+                if (seenLineDir.find(key) == seenLineDir.end()) {
+                    seenLineDir[key] = true;
+                    results.push_back({si.rbl, fl.lineName, fl.towards, fl.type});
+                }
             }
         } else if (lineDirMap.find(si.linienId) == lineDirMap.end()) {
             // Not in dirCache and lineDirMap can't resolve it either → probe live API
@@ -990,7 +1087,7 @@ void handleSearch() {
         if (it == lineDirMap.end()) continue;
         String towards = (si.richtung == "H") ? it->second.terminusH : it->second.terminusR;
         if (towards.length() == 0) towards = (si.richtung == "H") ? "Richtung H" : "Richtung R";
-        String key = it->second.name + "|" + towards;
+        String key = it->second.name + "|" + si.richtung;
         if (seenLineDir.find(key) != seenLineDir.end()) continue;
         seenLineDir[key] = true;
         results.push_back({si.rbl, it->second.name, towards, it->second.type});
@@ -1075,7 +1172,7 @@ void handleSave() {
             // Skip duplicates
             bool dup = false;
             for (auto& existing : cfgLines) {
-                if (existing.rbl == cl.rbl) { dup = true; break; }
+                if (existing.rbl == cl.rbl && existing.name == cl.name) { dup = true; break; }
             }
             if (!dup && cl.rbl.length() > 0) cfgLines.push_back(cl);
         }
@@ -1702,8 +1799,9 @@ void setupWiFi() {
 // ── API fetch ────────────────────────────────────────────────────────
 String buildUrl() {
     String url = "https://www.wienerlinien.at/ogd_realtime/monitor?activateTrafficInfo=stoerunglang";
+    std::map<String, bool> seen;
     for (auto& cl : cfgLines) {
-        url += "&rbl=" + cl.rbl;
+        if (!seen[cl.rbl]) { url += "&rbl=" + cl.rbl; seen[cl.rbl] = true; }
     }
     return url;
 }
@@ -1741,6 +1839,10 @@ void fetchDepartures() {
         return;
     }
 
+    // Build set of configured (rbl|lineName) pairs for filtering
+    std::map<String, bool> cfgLineSet;
+    for (auto& cl : cfgLines) cfgLineSet[cl.rbl + "|" + cl.name] = true;
+
     std::vector<Departure> newDeps;
     bool dirCacheUpdated = false;
     JsonArray monitors = doc["data"]["monitors"].as<JsonArray>();
@@ -1756,11 +1858,13 @@ void fetchDepartures() {
 
             // Cache direction info from live data
             if (rbl.length() > 0 && name.length() > 0 && towards.length() > 0) {
-                if (dirCache.find(rbl) == dirCache.end() || dirCache[rbl].towards != towards) {
-                    cacheDirEntry(rbl, name, towards, type, stopName);
-                    dirCacheUpdated = true;
-                }
+                size_t szBefore = dirCache[rbl].size();
+                cacheDirEntry(rbl, name, towards, type, stopName);
+                if (dirCache[rbl].size() != szBefore) dirCacheUpdated = true;
             }
+
+            // Only include departures for configured lines
+            if (!cfgLineSet[rbl + "|" + name]) continue;
 
             JsonArray deps = line["departures"]["departure"].as<JsonArray>();
             for (JsonObject dep : deps) {
@@ -2455,8 +2559,8 @@ void dataTask(void* param) {
         // Refresh CSV cache if stale, then rebuild line directions
         if (!isCacheValid()) {
             if (refreshCsvCache(true)) buildLineDirections();
-        } else if (lineDirMap.empty() && SPIFFS.exists(CACHE_STEIGE_PATH)) {
-            // Cache valid but line directions not loaded yet (e.g. first boot after flash)
+        } else if ((lineDirMap.empty() || haltRecordCount == 0) && SPIFFS.exists(CACHE_STEIGE_PATH)) {
+            // Cache valid but line directions or search indexes not built yet
             buildLineDirections();
         }
         // Check for OTA updates every 6h
@@ -2658,7 +2762,8 @@ void setup() {
         MDNS.addService("http", "tcp", 80);
         logf("mDNS: %s.local\n", cfgHostname.c_str());
     }
-    logf("Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    logf("Connected! IP: %s heap=%u psram=%u\n",
+         WiFi.localIP().toString().c_str(), ESP.getFreeHeap(), ESP.getFreePsram());
     startConfigServer();
 
     // Briefly show assigned hostname on splash so user always knows the URL
