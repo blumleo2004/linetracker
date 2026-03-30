@@ -14,8 +14,40 @@
 #include <map>
 #include <time.h>
 
+// ── In-memory log ring buffer (accessible via /logs) ─────────────────
+#define LOG_BUF_SIZE 8192
+static char logBuf[LOG_BUF_SIZE];
+static int  logHead = 0;
+static bool logWrapped = false;
+
+void logWrite(const char* msg) {
+    Serial.print(msg);
+    for (int i = 0; msg[i]; i++) {
+        logBuf[logHead] = msg[i];
+        logHead = (logHead + 1) % LOG_BUF_SIZE;
+        if (logHead == 0) logWrapped = true;
+    }
+}
+
+void logf(const char* fmt, ...) {
+    char tmp[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(tmp, sizeof(tmp), fmt, args);
+    va_end(args);
+    logWrite(tmp);
+}
+
+String getLogContents() {
+    String out;
+    out.reserve(LOG_BUF_SIZE);
+    if (logWrapped) for (int i = logHead; i < LOG_BUF_SIZE; i++) if (logBuf[i]) out += logBuf[i];
+    for (int i = 0; i < logHead; i++) if (logBuf[i]) out += logBuf[i];
+    return out;
+}
+
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.1.4"
+#define FW_VERSION "1.1.5"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -122,7 +154,7 @@ void loadLineDirections() {
             lineDirMap[String(kv.key().c_str())] = info;
         }
     }
-    Serial.printf("Line directions loaded: %d lines\n", lineDirMap.size());
+    logf("Line directions loaded: %d entries\n", lineDirMap.size());
 }
 
 static int  cfgRotateSec      = 5;     // page switch interval in seconds (default 5)
@@ -308,13 +340,13 @@ void saveCacheTimestamp() {
 }
 
 void buildLineDirections() {
-    Serial.println("Building line directions...");
+    logf("Building line directions...\n");
 
     // Step 1: Load all line info from linien.csv
     std::map<String, std::pair<String,String>> lineInfoMap; // id → {name, type}
     {
         File f = SPIFFS.open(CACHE_LINIEN_PATH, "r");
-        if (!f) { Serial.println("linien.csv not found"); return; }
+        if (!f) { logf("linien.csv not found\n"); return; }
         while (f.available()) {
             String line = f.readStringUntil('\n');
             int s1 = line.indexOf(';'); if (s1 < 0) continue;
@@ -336,7 +368,7 @@ void buildLineDirections() {
     std::map<String, TermInfo> termMap;
     {
         File f = SPIFFS.open(CACHE_STEIGE_PATH, "r");
-        if (!f) { Serial.println("steige.csv not found"); return; }
+        if (!f) { logf("steige.csv not found\n"); return; }
         while (f.available()) {
             String line = f.readStringUntil('\n');
             int s1 = line.indexOf(';'); if (s1 < 0) continue;
@@ -364,7 +396,7 @@ void buildLineDirections() {
     }
     {
         File f = SPIFFS.open(CACHE_HALT_PATH, "r");
-        if (!f) { Serial.println("halt.csv not found"); return; }
+        if (!f) { logf("halt.csv not found\n"); return; }
         while (f.available()) {
             String line = f.readStringUntil('\n');
             int s1 = line.indexOf(';'); if (s1 < 0) continue;
@@ -396,10 +428,11 @@ void buildLineDirections() {
         File f = SPIFFS.open(LINE_DIRS_PATH, "w");
         if (f) { serializeJson(doc, f); f.close(); }
     }
-    Serial.printf("Line directions built: %d lines\n", count);
+    logf("Line directions built: %d lines\n", count);
 
     // Reload into memory
     loadLineDirections();
+    logf("lineDirMap loaded: %d entries\n", lineDirMap.size());
 }
 
 bool refreshCsvCache(bool force = false) {
@@ -407,19 +440,19 @@ bool refreshCsvCache(bool force = false) {
         && SPIFFS.exists(CACHE_HALT_PATH)
         && SPIFFS.exists(CACHE_STEIGE_PATH)
         && SPIFFS.exists(CACHE_LINIEN_PATH)) {
-        Serial.println("CSV cache valid, skipping download");
+        logf("CSV cache valid, skipping download\n");
         return true;
     }
-    Serial.println("Downloading CSV cache...");
+    logf("Downloading CSV cache...\n");
     bool ok = true;
     ok &= downloadCsvToCache("https://data.wien.gv.at/csv/wienerlinien-ogd-haltestellen.csv", CACHE_HALT_PATH);
     ok &= downloadCsvToCache("https://data.wien.gv.at/csv/wienerlinien-ogd-steige.csv", CACHE_STEIGE_PATH);
     ok &= downloadCsvToCache("https://data.wien.gv.at/csv/wienerlinien-ogd-linien.csv", CACHE_LINIEN_PATH);
     if (ok) {
         saveCacheTimestamp();
-        Serial.println("CSV cache updated");
+        logf("CSV cache updated\n");
     } else {
-        Serial.println("CSV cache download failed (partial)");
+        logf("CSV cache download failed (partial)\n");
     }
     return ok;
 }
@@ -573,6 +606,38 @@ std::vector<SteigeInfo> findSteigeForStation(const String& haltId) {
             bool dup = false;
             for (auto& r : results) { if (r.rbl == rbl) { dup = true; break; } }
             if (!dup) results.push_back({rbl, linienId, richtung});
+        }
+    }
+    f.close();
+    return results;
+}
+
+// Read steige.csv once for multiple station IDs simultaneously
+std::map<String, std::vector<SteigeInfo>> findSteigeForStations(const std::vector<String>& haltIds) {
+    std::map<String, std::vector<SteigeInfo>> results;
+    File f = SPIFFS.open(CACHE_STEIGE_PATH, "r");
+    if (!f) return results;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        int s1 = line.indexOf(';'); if (s1 < 0) continue;
+        int s2 = line.indexOf(';', s1 + 1); if (s2 < 0) continue;
+        int s3 = line.indexOf(';', s2 + 1); if (s3 < 0) continue;
+        String foundHalt = line.substring(s2 + 1, s3);
+        foundHalt.replace("\"", "");
+        bool matched = false;
+        for (auto& id : haltIds) { if (foundHalt == id) { matched = true; break; } }
+        if (!matched) continue;
+        int s4 = line.indexOf(';', s3 + 1); if (s4 < 0) continue;
+        String richtung = line.substring(s3 + 1, s4); richtung.replace("\"", "");
+        int s5 = line.indexOf(';', s4 + 1); if (s5 < 0) continue;
+        int s6 = line.indexOf(';', s5 + 1); if (s6 < 0) continue;
+        String rbl = line.substring(s5 + 1, s6); rbl.replace("\"", ""); rbl.trim();
+        String linienId = line.substring(s1 + 1, s2); linienId.replace("\"", "");
+        if (rbl.length() > 0) {
+            auto& vec = results[foundHalt];
+            bool dup = false;
+            for (auto& r : vec) { if (r.rbl == rbl) { dup = true; break; } }
+            if (!dup) vec.push_back({rbl, linienId, richtung});
         }
     }
     f.close();
@@ -862,7 +927,9 @@ void handleSearch() {
         return;
     }
 
+    unsigned long t0 = millis();
     auto stations = searchStations(query);
+    logf("[search] q='%s' csv scan: %lums, stations: %d\n", query.c_str(), millis()-t0, stations.size());
 
     if (stations.empty()) {
         String html = FPSTR(HTML_HEAD);
@@ -886,18 +953,22 @@ void handleSearch() {
     std::vector<SearchResult> results;
     std::map<String, bool> seenLineDir;  // dedupe by lineName|towards
 
-    // Collect all RBLs for matched stations
+    // Collect all RBLs — read steige.csv once for all matched stations
+    unsigned long t1 = millis();
+    std::vector<String> haltIds;
+    for (auto& st : stations) haltIds.push_back(st.first);
+    auto steigeByHalt = findSteigeForStations(haltIds);
     std::vector<SteigeInfo> allSteige;
-    for (auto& st : stations) {
-        auto steige = findSteigeForStation(st.first);
-        for (auto& s : steige) {
+    for (auto& kv : steigeByHalt)
+        for (auto& s : kv.second) {
             bool dup = false;
             for (auto& a : allSteige) { if (a.rbl == s.rbl) { dup = true; break; } }
             if (!dup) allSteige.push_back(s);
         }
-    }
+    logf("[search] steige scan: %lums, rbls: %d\n", millis()-t1, allSteige.size());
 
     // Layer 1: Add lines from dirCache (most accurate — from live departures)
+    // uncachedRbls: RBLs not in dirCache AND not resolvable by lineDirMap (truly unknown)
     std::vector<String> uncachedRbls;
     for (auto& si : allSteige) {
         auto it = dirCache.find(si.rbl);
@@ -907,7 +978,8 @@ void handleSearch() {
                 seenLineDir[key] = true;
                 results.push_back({si.rbl, it->second.lineName, it->second.towards, it->second.type});
             }
-        } else {
+        } else if (lineDirMap.find(si.linienId) == lineDirMap.end()) {
+            // Not in dirCache and lineDirMap can't resolve it either → probe live API
             uncachedRbls.push_back(si.rbl);
         }
     }
@@ -924,9 +996,14 @@ void handleSearch() {
         results.push_back({si.rbl, it->second.name, towards, it->second.type});
     }
 
-    // Layer 3: Probe uncached RBLs via live API — only if layers 1+2 found nothing
-    if (results.empty() && !uncachedRbls.empty() && WiFi.status() == WL_CONNECTED) {
+    logf("[search] L1+L2: %d results, uncached: %d, lineDirMap: %d\n", results.size(), uncachedRbls.size(), lineDirMap.size());
+
+    // Layer 3: Probe live API for RBLs that neither dirCache nor lineDirMap could resolve.
+    // This covers: new lines not yet in the CSV, and first-boot before lineDirMap is built.
+    if (!uncachedRbls.empty() && WiFi.status() == WL_CONNECTED) {
+        unsigned long t3 = millis();
         auto probed = probeRbls(uncachedRbls);
+        logf("[search] L3 probe: %lums, found: %d\n", millis()-t3, probed.size());
         for (auto& fl : probed) {
             String key = fl.lineName + "|" + fl.towards;
             if (seenLineDir.find(key) != seenLineDir.end()) continue;
@@ -934,6 +1011,8 @@ void handleSearch() {
             results.push_back({fl.rbl, fl.lineName, fl.towards, fl.type});
         }
     }
+
+    logf("[search] total: %lums, %d results\n", millis()-t0, results.size());
 
     // Sort by transport type: U-Bahn → Tram → Bus → Train → other
     std::sort(results.begin(), results.end(), [](const SearchResult& a, const SearchResult& b) {
@@ -944,6 +1023,10 @@ void handleSearch() {
 
     String html = FPSTR(HTML_HEAD);
     html += "<div class='card'><h2>Ergebnisse: " + query + "</h2>";
+
+    if (lineDirMap.empty()) {
+        html += "<p class='hint' style='color:#ffbf00'>&#9888; Liniendatenbank wird noch geladen &mdash; Ergebnisse m&ouml;glicherweise unvollst&auml;ndig. Seite in ca. 1 Minute neu laden.</p>";
+    }
 
     if (results.empty()) {
         html += "<p class='status'>Keine Linien gefunden</p>";
@@ -1502,6 +1585,17 @@ void startConfigServer() {
     server.on("/update", handleOtaCheck);
     server.on("/update-now", handleOtaDoUpdate);
     server.on("/update-progress", handleOtaProgress);
+    server.on("/logs", []() {
+        String html = "<html><head><meta charset='utf-8'>"
+                      "<meta http-equiv='refresh' content='2'>"
+                      "<style>body{background:#0a0805;color:#ffbf00;font-family:monospace;"
+                      "font-size:13px;padding:12px;white-space:pre-wrap;word-break:break-all}"
+                      "a{color:#ffbf00}</style></head><body>"
+                      "<a href='/'>← Home</a>  <a href='/logs'>⟳ Refresh</a>\n\n";
+        html += getLogContents();
+        html += "</body></html>";
+        server.send(200, "text/html; charset=utf-8", html);
+    });
     server.begin();
     configMode = true;
 }
@@ -1803,7 +1897,7 @@ void fetchOebbDepartures() {
 
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo, 5000)) {
-        Serial.println("OeBB: NTP time not available");
+        logf("OeBB: NTP not available\n");
         return;
     }
     int nowMin = timeinfo.tm_hour * 60 + timeinfo.tm_min;
@@ -2327,14 +2421,14 @@ void dataTask(void* param) {
         struct tm ti;
         int ntpWaits = 0;
         while (!getLocalTime(&ti, 1000) && ntpWaits < 4) ntpWaits++;
-        Serial.println(getLocalTime(&ti, 0) ? "NTP synced" : "NTP timeout, will retry");
+        logf("%s\n", getLocalTime(&ti, 0) ? "NTP synced" : "NTP timeout, will retry");
     }
 
     unsigned long lastOtaCheck = millis();
     for (;;) {
         // Auto-reconnect WiFi if disconnected (with retries)
         if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("WiFi lost, reconnecting...");
+            logf("WiFi lost, reconnecting...\n");
             for (int attempt = 0; attempt < 3; attempt++) {
                 WiFi.disconnect();
                 vTaskDelay(pdMS_TO_TICKS(1000));
@@ -2345,7 +2439,7 @@ void dataTask(void* param) {
                     retries++;
                 }
                 if (WiFi.status() == WL_CONNECTED) {
-                    Serial.println("WiFi reconnected: " + WiFi.localIP().toString());
+                    logf("WiFi reconnected: %s\n", WiFi.localIP().toString().c_str());
                     MDNS.begin(cfgHostname.c_str());
                     MDNS.addService("http", "tcp", 80);
                     break;
@@ -2353,7 +2447,7 @@ void dataTask(void* param) {
                 Serial.printf("WiFi reconnect attempt %d failed\n", attempt + 1);
             }
             if (WiFi.status() != WL_CONNECTED) {
-                Serial.println("WiFi reconnect failed after 3 attempts, will retry next cycle");
+                logf("WiFi reconnect failed after 3 attempts\n");
             }
         }
         fetchDepartures();
@@ -2452,7 +2546,7 @@ void checkResetButton() {
 // ── Setup & Loop ─────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    Serial.println("LineTracker v" + String(FW_VERSION) + " starting...");
+    logf("LineTracker v%s starting...\n", FW_VERSION);
 
     tft.init();
     delay(150);  // give ST7789 time to wake up before first draw
@@ -2511,7 +2605,7 @@ void setup() {
     delay(2000);  // show splash for 2 seconds
     // ── End splash ──────────────────────────────────────────────────
 
-    if (!SPIFFS.begin(true)) Serial.println("SPIFFS mount failed");
+    if (!SPIFFS.begin(true)) logf("SPIFFS mount failed\n");
 
     loadConfig();
     if (cfgHostname.length() == 0) {
@@ -2550,7 +2644,7 @@ void setup() {
             if (cfgHostname != uniqueName) {
                 cfgHostname = uniqueName;
                 saveConfig();
-                Serial.println("Hostname conflict — using: " + cfgHostname);
+                logf("Hostname conflict — using: %s\n", cfgHostname.c_str());
             }
         } else if (cfgHostname != "linetracker") {
             // No conflict — revert to default if we had a MAC-based name
@@ -2562,9 +2656,9 @@ void setup() {
     // Start mDNS + web server immediately so user can access UI
     if (MDNS.begin(cfgHostname.c_str())) {
         MDNS.addService("http", "tcp", 80);
-        Serial.println("mDNS: " + cfgHostname + ".local");
+        logf("mDNS: %s.local\n", cfgHostname.c_str());
     }
-    Serial.println("Connected! IP: " + WiFi.localIP().toString());
+    logf("Connected! IP: %s\n", WiFi.localIP().toString().c_str());
     startConfigServer();
 
     // Briefly show assigned hostname on splash so user always knows the URL
@@ -2587,8 +2681,8 @@ void setup() {
     // NTP config (sync happens in background, no blocking wait)
     configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
 
-    Serial.print("WL Lines: "); Serial.println(cfgLines.size());
-    Serial.print("OeBB Stations: "); Serial.println(cfgOebb.size());
+    logf("WL Lines: %d\n", cfgLines.size());
+    logf("OeBB Stations: %d\n", cfgOebb.size());
 
     // Start data fetch task immediately (handles NTP wait, CSV cache, line directions)
     xTaskCreatePinnedToCore(dataTask,    "data",    16384, NULL, 1, NULL, 0);
