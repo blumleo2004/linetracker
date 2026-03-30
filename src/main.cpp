@@ -15,7 +15,7 @@
 #include <time.h>
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.1.2"
+#define FW_VERSION "1.1.3"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -130,8 +130,9 @@ static int  cfgBrightness     = 255;   // backlight 0-255 (default max)
 static int  cfgNightFrom      = -1;    // night mode start hour (0-23), -1 = disabled
 static int  cfgNightTo        = -1;    // night mode end hour (0-23)
 static int  cfgNightBright    = 20;    // backlight during night mode
-static bool cfgShowNext       = false; // show next departure below main countdown
-static bool cfgShowDisruptions= false; // show WL disruption ticker at bottom
+static bool   cfgShowNext        = false; // show next departure below main countdown
+static bool   cfgShowDisruptions = false; // show WL disruption ticker at bottom
+static String cfgHostname        = "";    // mDNS hostname, generated from MAC on first boot
 
 struct ConfigLine {
     String rbl;
@@ -195,6 +196,7 @@ bool loadConfig() {
     cfgNightBright     = doc["night_bright"]      | 20;
     cfgShowNext        = doc["show_next"]         | false;
     cfgShowDisruptions = doc["show_disruptions"]  | false;
+    cfgHostname        = doc["hostname"]          | "";
     if (cfgRotateSec   < 2)   cfgRotateSec   = 2;
     if (cfgRotateSec   > 60)  cfgRotateSec   = 60;
     if (cfgBrightness  < 10)  cfgBrightness  = 10;
@@ -231,6 +233,7 @@ void saveConfig() {
     doc["night_bright"]     = cfgNightBright;
     doc["show_next"]        = cfgShowNext;
     doc["show_disruptions"] = cfgShowDisruptions;
+    doc["hostname"]         = cfgHostname;
     serializeJson(doc, f);
     f.close();
 }
@@ -289,13 +292,19 @@ bool isCacheValid() {
     if (!f) return false;
     String ts = f.readString();
     f.close();
-    unsigned long cached = strtoul(ts.c_str(), NULL, 10);
-    return (millis() - cached) < CACHE_MAX_AGE_MS;
+    time_t cached = (time_t)strtoull(ts.c_str(), NULL, 10);
+    if (cached < 1700000000) return false;  // invalid or legacy millis() timestamp
+    time_t now;
+    time(&now);
+    if (now < 1700000000) return true;  // NTP not synced yet, trust existing cache files
+    return difftime(now, cached) < (CACHE_MAX_AGE_MS / 1000);
 }
 
 void saveCacheTimestamp() {
+    time_t now;
+    time(&now);
     File f = SPIFFS.open(CACHE_TS_PATH, "w");
-    if (f) { f.print(millis()); f.close(); }
+    if (f) { f.print((unsigned long long)now); f.close(); }
 }
 
 void buildLineDirections() {
@@ -409,7 +418,6 @@ bool refreshCsvCache(bool force = false) {
     if (ok) {
         saveCacheTimestamp();
         Serial.println("CSV cache updated");
-        buildLineDirections();
     } else {
         Serial.println("CSV cache download failed (partial)");
     }
@@ -722,7 +730,7 @@ String badgeClassForType(const String& type) {
 
 void sendHtml(const String& html) {
     server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    sendHtml(html);
+    server.send(200, "text/html; charset=utf-8", html);
 }
 
 void handleRoot() {
@@ -916,8 +924,8 @@ void handleSearch() {
         results.push_back({si.rbl, it->second.name, towards, it->second.type});
     }
 
-    // Layer 3: Probe uncached RBLs via live API (discovers shared-platform lines)
-    if (!uncachedRbls.empty() && WiFi.status() == WL_CONNECTED) {
+    // Layer 3: Probe uncached RBLs via live API — only if layers 1+2 found nothing
+    if (results.empty() && !uncachedRbls.empty() && WiFi.status() == WL_CONNECTED) {
         auto probed = probeRbls(uncachedRbls);
         for (auto& fl : probed) {
             String key = fl.lineName + "|" + fl.towards;
@@ -1962,10 +1970,10 @@ void drawDisplay() {
         // URL prominent
         sprite.setTextColor(AMBER, BG_COLOR);
         sprite.setTextSize(2);
-        const char* hostname = "linetracker.local";
-        tw = sprite.textWidth(hostname);
+        String hostnameStr = cfgHostname + ".local";
+        tw = sprite.textWidth(hostnameStr);
         sprite.setCursor((SCREEN_W - tw) / 2, 54);
-        sprite.print(hostname);
+        sprite.print(hostnameStr);
 
         // IP fallback
         sprite.setTextColor(AMBER_DIM, BG_COLOR);
@@ -1999,6 +2007,15 @@ void drawDisplay() {
         int tw = sprite.textWidth(msg);
         sprite.setCursor((SCREEN_W - tw) / 2, (SCREEN_H - 14) / 2);
         sprite.print(msg);
+        // Show IP as fallback for web access
+        String ip = WiFi.localIP().toString();
+        if (ip != "0.0.0.0") {
+            sprite.setTextColor(AMBER_DIM, BG_COLOR);
+            sprite.setTextSize(1);
+            int iw = sprite.textWidth(ip);
+            sprite.setCursor((SCREEN_W - iw) / 2, (SCREEN_H - 14) / 2 + 22);
+            sprite.print(ip);
+        }
     } else {
         // ── Smart display with page rotation ──
         // Cycle pages when more slots than rows
@@ -2031,6 +2048,17 @@ void drawDisplay() {
         int cdH   = 7 * CD_SZ;
         int dirLineH = 7 * DIR_SZ;
         int dirCharW = 6 * DIR_SZ;
+
+        // ── IP address (tiny, top-right, always visible as fallback) ──
+        {
+            String ip = WiFi.localIP().toString();
+            sprite.setTextFont(1);
+            sprite.setTextSize(1);
+            sprite.setTextColor(tft.color565(25, 20, 5), BG_COLOR);
+            int iw = sprite.textWidth(ip);
+            sprite.setCursor(SCREEN_W - iw - 2, 2);
+            sprite.print(ip);
+        }
 
         // ── Dynamic column widths ──
         sprite.setTextSize(NAME_SZ);
@@ -2294,12 +2322,14 @@ void applyNightMode() {
 
 // ── FreeRTOS tasks ───────────────────────────────────────────────────
 void dataTask(void* param) {
-    // Build line directions on first run if missing (non-blocking — runs in background)
-    if (lineDirMap.empty() && SPIFFS.exists(CACHE_STEIGE_PATH)) {
-        Serial.println("Building line directions in background...");
-        buildLineDirections();
+    // Wait for NTP sync (non-blocking, max 4s)
+    {
+        struct tm ti;
+        int ntpWaits = 0;
+        while (!getLocalTime(&ti, 1000) && ntpWaits < 4) ntpWaits++;
+        Serial.println(getLocalTime(&ti, 0) ? "NTP synced" : "NTP timeout, will retry");
     }
-    unsigned long lastCacheRefresh = millis();
+
     unsigned long lastOtaCheck = millis();
     for (;;) {
         // Auto-reconnect WiFi if disconnected (with retries)
@@ -2316,7 +2346,7 @@ void dataTask(void* param) {
                 }
                 if (WiFi.status() == WL_CONNECTED) {
                     Serial.println("WiFi reconnected: " + WiFi.localIP().toString());
-                    MDNS.begin("linetracker");
+                    MDNS.begin(cfgHostname.c_str());
                     MDNS.addService("http", "tcp", 80);
                     break;
                 }
@@ -2328,10 +2358,12 @@ void dataTask(void* param) {
         }
         fetchDepartures();
         fetchOebbDepartures();
-        // Refresh CSV cache every 24h
-        if (millis() - lastCacheRefresh > CACHE_MAX_AGE_MS) {
-            refreshCsvCache(true);
-            lastCacheRefresh = millis();
+        // Refresh CSV cache if stale, then rebuild line directions
+        if (!isCacheValid()) {
+            if (refreshCsvCache(true)) buildLineDirections();
+        } else if (lineDirMap.empty() && SPIFFS.exists(CACHE_STEIGE_PATH)) {
+            // Cache valid but line directions not loaded yet (e.g. first boot after flash)
+            buildLineDirections();
         }
         // Check for OTA updates every 6h
         if (millis() - lastOtaCheck > OTA_CHECK_INTERVAL_MS) {
@@ -2482,6 +2514,14 @@ void setup() {
     if (!SPIFFS.begin(true)) Serial.println("SPIFFS mount failed");
 
     loadConfig();
+    if (cfgHostname.length() == 0) {
+        uint8_t mac[6];
+        WiFi.macAddress(mac);
+        char suffix[5];
+        snprintf(suffix, sizeof(suffix), "%02x%02x", mac[4], mac[5]);
+        cfgHostname = "linetracker-" + String(suffix);
+        saveConfig();
+    }
     loadDirCache();
     loadLineDirections();
     ledcWrite(0, cfgBrightness);
@@ -2494,10 +2534,13 @@ void setup() {
 
     setupWiFi();
 
+    // Give the WiFi stack a moment to fully stabilize before starting mDNS
+    delay(500);
+
     // Start mDNS + web server immediately so user can access UI
-    if (MDNS.begin("linetracker")) {
+    if (MDNS.begin(cfgHostname.c_str())) {
         MDNS.addService("http", "tcp", 80);
-        Serial.println("mDNS: linetracker.local");
+        Serial.println("mDNS: " + cfgHostname + ".local");
     }
     Serial.println("Connected! IP: " + WiFi.localIP().toString());
     startConfigServer();
@@ -2506,31 +2549,13 @@ void setup() {
     dataMutex = xSemaphoreCreateMutex();
     xTaskCreatePinnedToCore(displayTask, "display", 8192,  NULL, 1, NULL, 1);
 
-    // NTP + CSV cache in background — show status on splash
-    tft.fillRect(0, 135, 320, 25, BG_COLOR);
-    tft.setTextColor(AMBER_DIM, BG_COLOR);
-    tft.setTextFont(1);
-    tft.setTextSize(1);
-    tft.setCursor((320 - tft.textWidth("Synchronisiere...")) / 2, 140);
-    tft.print("Synchronisiere...");
-
+    // NTP config (sync happens in background, no blocking wait)
     configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
-    {
-        struct tm ti;
-        int ntpWaits = 0;
-        while (!getLocalTime(&ti, 1000) && ntpWaits < 4) ntpWaits++;
-        Serial.println(getLocalTime(&ti, 0) ? "NTP synced" : "NTP timeout, will retry");
-    }
-
-    tft.fillRect(0, 135, 320, 25, BG_COLOR);
-    tft.setCursor((320 - tft.textWidth("Lade Stationsdaten...")) / 2, 140);
-    tft.print("Lade Stationsdaten...");
-    refreshCsvCache();
 
     Serial.print("WL Lines: "); Serial.println(cfgLines.size());
     Serial.print("OeBB Stations: "); Serial.println(cfgOebb.size());
 
-    // Start data fetch task immediately (also builds line directions on first run)
+    // Start data fetch task immediately (handles NTP wait, CSV cache, line directions)
     xTaskCreatePinnedToCore(dataTask,    "data",    16384, NULL, 1, NULL, 0);
 }
 
