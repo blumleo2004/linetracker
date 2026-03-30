@@ -11,6 +11,7 @@
 #include <DNSServer.h>
 #include <WiFiManager.h>
 #include <HTTPUpdate.h>
+#include <esp_system.h>
 #include <vector>
 #include <map>
 #include <algorithm>
@@ -18,6 +19,7 @@
 
 // ── In-memory log ring buffer (accessible via /logs) ─────────────────
 #define LOG_BUF_SIZE 8192
+#define LOG_REQ() logf("[req] %s  heap=%u\n", server.uri().c_str(), ESP.getFreeHeap())
 static char logBuf[LOG_BUF_SIZE];
 static int  logHead = 0;
 static bool logWrapped = false;
@@ -48,8 +50,55 @@ String getLogContents() {
     return out;
 }
 
+// ── Crash tracking ──────────────────────────────────────────────────
+// RTC memory survives any reset (panic, WDT, brownout) but not power cycle.
+// We store a breadcrumb (last known location) and heap so we know what the
+// device was doing when it crashed.
+RTC_DATA_ATTR static uint32_t rtcBootCount = 0;
+RTC_DATA_ATTR static char     rtcCrumb[48] = "boot";
+RTC_DATA_ATTR static uint32_t rtcHeap      = 0;
+
+static const char* CRASH_LOG_PATH = "/crash.log";
+
+void setCrumb(const char* s) {
+    strncpy(rtcCrumb, s, sizeof(rtcCrumb) - 1);
+    rtcCrumb[sizeof(rtcCrumb) - 1] = '\0';
+    rtcHeap = ESP.getFreeHeap();
+}
+
+void saveCrashInfo() {
+    // Must be called after SPIFFS.begin()
+    esp_reset_reason_t r = esp_reset_reason();
+    rtcBootCount++;
+
+    const char* rs = nullptr;
+    switch (r) {
+        case ESP_RST_PANIC:    rs = "panic";    break;
+        case ESP_RST_INT_WDT:  rs = "int_wdt";  break;
+        case ESP_RST_TASK_WDT: rs = "task_wdt"; break;
+        case ESP_RST_WDT:      rs = "wdt";      break;
+        case ESP_RST_BROWNOUT: rs = "brownout"; break;
+        default: break;
+    }
+    if (!rs) return; // normal power-on or software restart — don't log
+
+    // Keep log under 4 KB
+    if (SPIFFS.exists(CRASH_LOG_PATH)) {
+        File f = SPIFFS.open(CRASH_LOG_PATH, "r");
+        if (f && f.size() > 3800) { f.close(); SPIFFS.remove(CRASH_LOG_PATH); }
+        else if (f) f.close();
+    }
+
+    File f = SPIFFS.open(CRASH_LOG_PATH, "a");
+    if (!f) return;
+    f.printf("boot#%u  reason=%-10s  at=%-24s  heap=%u\n",
+             (unsigned)rtcBootCount, rs, rtcCrumb, (unsigned)rtcHeap);
+    f.close();
+    logf("[crash] logged: reason=%s at=%s heap=%u\n", rs, rtcCrumb, (unsigned)rtcHeap);
+}
+
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.1.8"
+#define FW_VERSION "1.1.9"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -382,6 +431,7 @@ void saveCacheTimestamp() {
 }
 
 void buildLineDirections() {
+    setCrumb("buildLineDirections");
     logf("Building line directions... heap=%u psram=%u\n",
          ESP.getFreeHeap(), ESP.getFreePsram());
 
@@ -921,8 +971,10 @@ void sendHtml(const String& html) {
 }
 
 void handleRoot() {
+    LOG_REQ();
+    unsigned long t0 = millis();
     String html = FPSTR(HTML_HEAD);
-
+    logf("[root] HTML_HEAD: %lums\n", millis()-t0);
 
     if (server.hasArg("saved")) {
         html += "<div class='toast'>Gespeichert</div>"
@@ -946,6 +998,7 @@ void handleRoot() {
         }
     }
     html += "</div>";
+    logf("[root] active lines: %lums\n", millis()-t0);
 
     html += "<div class='card'><h2>S-Bahn / Züge (ÖBB)</h2>";
     if (cfgOebb.empty()) {
@@ -967,6 +1020,7 @@ void handleRoot() {
     html += "<input type='text' name='q' placeholder='z.B. Wien Rennweg, Meidling...'>";
     html += "<button class='add' type='submit'>ÖBB-Station suchen</button>";
     html += "</form></div>";
+    logf("[root] oebb card: %lums\n", millis()-t0);
 
     html += "<div class='card'><h2>Station suchen</h2>";
     html += "<form action='/search' method='GET'>";
@@ -975,6 +1029,7 @@ void handleRoot() {
     html += "</form>";
     html += "<a href='/browse'><button class='btn-info' style='margin-top:8px'>Alle Stationen durchblättern</button></a>";
     html += "</div>";
+    logf("[root] search card: %lums\n", millis()-t0);
 
     html += "<div class='card'><h2>Einstellungen</h2>";
     html += "<form action='/settings' method='POST'>";
@@ -1015,11 +1070,12 @@ void handleRoot() {
 
     html += "<button class='btn-secondary' type='submit' style='margin-top:14px'>Speichern</button>";
     html += "</form></div>";
+    logf("[root] settings card: %lums\n", millis()-t0);
 
     html += "<div class='card'><h2>WiFi</h2>";
     html += "<p class='info-text'>Verbunden mit: <b>" + WiFi.SSID() + "</b></p>";
     html += "<p class='hint'>Nur 2,4 GHz Netzwerke werden unterstützt.</p>";
-    html += "<form action='/wifi-reset' method='POST'>";
+    html += "<form action='/wifi-reset' method='POST' onsubmit=\"return confirm('WLAN wirklich ändern? Der Monitor öffnet kurz einen Hotspot zum Neu-Einrichten.')\">";
     html += "<button class='btn-warn'>WLAN ändern</button>";
     html += "</form></div>";
 
@@ -1040,10 +1096,13 @@ void handleRoot() {
     html += "</div>";
 
     html += "</body></html>";
+    logf("[root] html built: %lums  size: %u bytes\n", millis()-t0, html.length());
     sendHtml(html);
+    logf("[root] sendHtml done: %lums\n", millis()-t0);
 }
 
 void handleSearch() {
+    LOG_REQ();
     String query = server.arg("q");
     if (query.length() < 2) {
         server.sendHeader("Location", "/");
@@ -1183,6 +1242,7 @@ void handleSearch() {
 }
 
 void handleSave() {
+    LOG_REQ();
     for (int i = 0; i < server.args(); i++) {
         if (server.argName(i) == "line") {
             String val = server.arg(i);
@@ -1274,6 +1334,7 @@ String searchOebbStation(const String& query) {
 }
 
 void handleOebbSearch() {
+    LOG_REQ();
     String query = server.arg("q");
     query.trim();
     if (query.length() < 2) {
@@ -1400,6 +1461,8 @@ void handleOebbRemove() {
 }
 
 void handleBrowse() {
+    LOG_REQ();
+    unsigned long t0 = millis();
     String html = FPSTR(HTML_HEAD);
 
     html += "<div class='card'><h2>Stationen A-Z</h2>";
@@ -1468,10 +1531,13 @@ void handleBrowse() {
     }
 
     html += "<br><a href='/'><button>Zurück</button></a></div></body></html>";
+    logf("[browse] html built: %lums  size: %u bytes\n", millis()-t0, html.length());
     sendHtml(html);
+    logf("[browse] sendHtml done: %lums\n", millis()-t0);
 }
 
 void handleWifiReset() {
+    LOG_REQ();
     // Set flag so setup() opens config portal on restart
     File f = SPIFFS.open(WIFI_RESET_FLAG, "w");
     if (f) { f.print("1"); f.close(); }
@@ -1486,6 +1552,7 @@ void handleWifiReset() {
 }
 
 void handleFactoryReset() {
+    LOG_REQ();
     SPIFFS.remove(CONFIG_PATH);
     SPIFFS.remove(DIR_CACHE_PATH);
     SPIFFS.remove(LINE_DIRS_PATH);
@@ -1509,6 +1576,7 @@ void handleFactoryReset() {
 }
 
 void handleSettings() {
+    LOG_REQ();
     if (server.hasArg("rotate_sec")) {
         cfgRotateSec = server.arg("rotate_sec").toInt();
         if (cfgRotateSec < 2)  cfgRotateSec = 2;
@@ -1648,23 +1716,38 @@ String checkRemoteVersion() {
 }
 
 void handleOtaCheck() {
-    String remoteVer = checkRemoteVersion();
+    LOG_REQ();
     String html = FPSTR(HTML_HEAD);
     html += "<div class='card'><h2>Firmware Update</h2>";
     html += "<p style='font-size:13px;color:#aaa;margin-bottom:12px'>Installiert: <b style='color:#eee'>v" + String(FW_VERSION) + "</b></p>";
-
-    if (remoteVer.length() == 0) {
-        html += "<p class='status'>Updateserver nicht erreichbar.</p>";
-    } else if (isNewerVersion(remoteVer, FW_VERSION)) {
-        html += "<p style='text-align:center;color:#1a8f3c;font-size:16px;font-weight:600;margin:12px 0'>v" + remoteVer + " verfügbar!</p>";
-        html += "<a href='/update-now'><button class='add'>Jetzt updaten</button></a>";
-    } else {
-        html += "<p class='status'>Firmware ist aktuell.</p>";
-    }
-
+    html += "<div id='res'><p class='status'>Prüfe auf Updates...</p></div>";
+    html += "<script>"
+            "fetch('/update-status').then(r=>r.json()).then(function(d){"
+            "var el=document.getElementById('res');"
+            "if(d.err){el.innerHTML=\"<p class='status'>Updateserver nicht erreichbar.</p>\";}"
+            "else if(d.newer){el.innerHTML=\"<p style='text-align:center;color:#1a8f3c;font-size:16px;font-weight:600;margin:12px 0'>v\"+d.ver+\" verf\\u00fcgbar!</p>"
+            "<a href='/update-now'><button class='add'>Jetzt updaten</button></a>\";}"
+            "else{el.innerHTML=\"<p class='status'>Firmware ist aktuell.</p>\";}"
+            "}).catch(function(){document.getElementById('res').innerHTML=\"<p class='status'>Updateserver nicht erreichbar.</p>\";});"
+            "</script>";
     html += "<br><a href='/'><button class='btn-secondary'>Zurück</button></a>";
     html += "</div></body></html>";
     sendHtml(html);
+}
+
+void handleOtaStatus() {
+    unsigned long t0 = millis();
+    logf("[ota] status check started\n");
+    String remoteVer = checkRemoteVersion();
+    logf("[ota] checkRemoteVersion: %lums\n", millis()-t0);
+    if (remoteVer.length() == 0) {
+        server.send(200, "application/json", "{\"err\":1}");
+        return;
+    }
+    bool newer = isNewerVersion(remoteVer, FW_VERSION);
+    String json = "{\"ver\":\"" + remoteVer + "\",\"newer\":" + (newer ? "1" : "0") + "}";
+    server.send(200, "application/json", json);
+    logf("[ota] status done: %lums\n", millis()-t0);
 }
 
 void handleOtaDoUpdate() {
@@ -1710,8 +1793,34 @@ void startConfigServer() {
     server.on("/wifi-reset", HTTP_POST, handleWifiReset);
     server.on("/factory-reset", HTTP_POST, handleFactoryReset);
     server.on("/update", handleOtaCheck);
+    server.on("/update-status", handleOtaStatus);
     server.on("/update-now", handleOtaDoUpdate);
     server.on("/update-progress", handleOtaProgress);
+    server.on("/crash", []() {
+        String html = FPSTR(HTML_HEAD);
+        html += "<div class='card'><h2>Crash Log</h2>";
+        html += "<p class='hint'>boot#" + String((unsigned)rtcBootCount) +
+                " &nbsp;|&nbsp; at: " + String(rtcCrumb) +
+                " &nbsp;|&nbsp; heap: " + String((unsigned)rtcHeap) + "</p>";
+        if (!SPIFFS.exists(CRASH_LOG_PATH)) {
+            html += "<p class='status'>Kein Crash gespeichert.</p>";
+        } else {
+            File f = SPIFFS.open(CRASH_LOG_PATH, "r");
+            html += "<pre style='color:#ffbf00;font-size:12px;white-space:pre-wrap;word-break:break-all'>";
+            html += f.readString();
+            html += "</pre>";
+            f.close();
+            html += "<form method='post' action='/crash-clear' style='margin-top:8px'>"
+                    "<button class='btn-danger'>Log löschen</button></form>";
+        }
+        html += "</div></body></html>";
+        sendHtml(html);
+    });
+    server.on("/crash-clear", HTTP_POST, []() {
+        SPIFFS.remove(CRASH_LOG_PATH);
+        server.sendHeader("Location", "/crash");
+        server.send(302);
+    });
     // Captive portal detection — iOS/Android send these to check for portal
     auto captiveRedirect = []() {
         server.sendHeader("Location", "http://192.168.4.1/", true);
@@ -1846,6 +1955,7 @@ String buildUrl() {
 }
 
 void fetchDepartures() {
+    setCrumb("fetchDepartures");
     if (WiFi.status() != WL_CONNECTED) return;
     if (cfgLines.empty()) return;
 
@@ -2035,6 +2145,7 @@ std::vector<Departure> fetchOebbStation(const String& stationName, int nowMin) {
 }
 
 void fetchOebbDepartures() {
+    setCrumb("fetchOebbDepartures");
     if (WiFi.status() != WL_CONNECTED) return;
     if (cfgOebb.empty()) return;
 
@@ -2600,6 +2711,7 @@ void dataTask(void* param) {
 
     unsigned long lastOtaCheck = millis();
     for (;;) {
+        setCrumb("dataTask:idle");
         // WiFi state tracking — ESP32 auto-reconnects, we just manage the portal
         if (WiFi.status() != WL_CONNECTED) {
             if (wifiDownSince == 0) {
@@ -2726,6 +2838,7 @@ void setup() {
 
     if (!SPIFFS.begin(true)) logf("SPIFFS mount failed\n");
 
+    saveCrashInfo();
     loadConfig();
     if (cfgHostname.length() == 0) {
         cfgHostname = "linetracker";
