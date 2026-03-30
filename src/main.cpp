@@ -8,6 +8,7 @@
 #include <TFT_eSPI.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <WiFiManager.h>
 #include <HTTPUpdate.h>
 #include <vector>
@@ -48,7 +49,7 @@ String getLogContents() {
 }
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.1.6"
+#define FW_VERSION "1.1.7"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -109,6 +110,13 @@ static HaltRecord*   haltRecords        = nullptr;
 static int           haltRecordCount    = 0;
 static SteigeRecord* steigeRecords      = nullptr;
 static int           steigeRecordCount  = 0;
+
+// WiFi portal state
+static WiFiManager   wm;
+static DNSServer     apDns;
+static unsigned long wifiDownSince  = 0;
+static volatile bool portalOpen     = false;
+static volatile bool portalShouldOpen = false;
 
 void loadDirCache() {
     if (!SPIFFS.exists(DIR_CACHE_PATH)) return;
@@ -1682,6 +1690,18 @@ void startConfigServer() {
     server.on("/update", handleOtaCheck);
     server.on("/update-now", handleOtaDoUpdate);
     server.on("/update-progress", handleOtaProgress);
+    // Captive portal detection — iOS/Android send these to check for portal
+    auto captiveRedirect = []() {
+        server.sendHeader("Location", "http://192.168.4.1/", true);
+        server.send(302, "text/plain", "");
+    };
+    server.on("/hotspot-detect.html", captiveRedirect);   // iOS
+    server.on("/generate_204", captiveRedirect);           // Android
+    server.on("/connecttest.txt", captiveRedirect);        // Windows
+    server.onNotFound([captiveRedirect]() {
+        if (portalOpen) captiveRedirect();
+        else server.send(404, "text/plain", "Not found");
+    });
     server.on("/logs", []() {
         String html = "<html><head><meta charset='utf-8'>"
                       "<meta http-equiv='refresh' content='2'>"
@@ -1753,7 +1773,6 @@ void setupWiFi() {
     WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
     WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
 
-    WiFiManager wm;
     wm.setConnectRetries(3);              // retry connection up to 3 times
     wm.setMinimumSignalQuality(10);       // accept weak signals
 
@@ -1786,6 +1805,8 @@ void setupWiFi() {
         wm.setAPCallback([](WiFiManager* mgr) {
             showWifiSetupScreen("Ersteinrichtung");
         });
+        WiFi.setAutoReconnect(true);
+        WiFi.persistent(true);
         wm.setConnectTimeout(15);         // 15s for saved WiFi (was 5s)
         wm.setSaveConnectTimeout(30);     // wait 30s when user submits credentials in portal
         wm.setConfigPortalTimeout(180);
@@ -2142,12 +2163,43 @@ void drawDisplay() {
         return;
     }
 
-    // WiFi status indicator (top-right when disconnected)
+    // ── WiFi down screen ──
     if (WiFi.status() != WL_CONNECTED) {
-        sprite.setTextSize(1);
+        sprite.setTextColor(AMBER, BG_COLOR);
+        sprite.setTextSize(3);
+        const char* title = "Kein WLAN";
+        int tw = sprite.textWidth(title);
+        sprite.setCursor((SCREEN_W - tw) / 2, 18);
+        sprite.print(title);
+
+        sprite.drawFastHLine(40, 52, 240, AMBER_DIM);
+
         sprite.setTextColor(AMBER_DIM, BG_COLOR);
-        sprite.setCursor(SCREEN_W - 60, 2);
-        sprite.print("WiFi...");
+        sprite.setTextSize(1);
+        const char* sub1 = "Verbindet automatisch";
+        tw = sprite.textWidth(sub1);
+        sprite.setCursor((SCREEN_W - tw) / 2, 68);
+        sprite.print(sub1);
+        const char* sub2 = "wenn WLAN wieder verfuegbar ist.";
+        tw = sprite.textWidth(sub2);
+        sprite.setCursor((SCREEN_W - tw) / 2, 84);
+        sprite.print(sub2);
+
+        sprite.drawFastHLine(40, 110, 240, AMBER_DIM);
+
+        sprite.setTextColor(AMBER_DIM, BG_COLOR);
+        const char* h1 = "Mit \"LineTracker\" verbinden,";
+        tw = sprite.textWidth(h1);
+        sprite.setCursor((SCREEN_W - tw) / 2, 118);
+        sprite.print(h1);
+        const char* h2 = "dann linetracker.local oeffnen.";
+        tw = sprite.textWidth(h2);
+        sprite.setCursor((SCREEN_W - tw) / 2, 134);
+        sprite.print(h2);
+
+        sprite.pushSprite(0, 0);
+        sprite.deleteSprite();
+        return;
     }
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -2530,29 +2582,23 @@ void dataTask(void* param) {
 
     unsigned long lastOtaCheck = millis();
     for (;;) {
-        // Auto-reconnect WiFi if disconnected (with retries)
+        // WiFi state tracking — ESP32 auto-reconnects, we just manage the portal
         if (WiFi.status() != WL_CONNECTED) {
-            logf("WiFi lost, reconnecting...\n");
-            for (int attempt = 0; attempt < 3; attempt++) {
-                WiFi.disconnect();
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                WiFi.begin();
-                int retries = 0;
-                while (WiFi.status() != WL_CONNECTED && retries < 15) {
-                    vTaskDelay(pdMS_TO_TICKS(1000));
-                    retries++;
-                }
-                if (WiFi.status() == WL_CONNECTED) {
-                    logf("WiFi reconnected: %s\n", WiFi.localIP().toString().c_str());
-                    MDNS.begin(cfgHostname.c_str());
-                    MDNS.addService("http", "tcp", 80);
-                    break;
-                }
-                Serial.printf("WiFi reconnect attempt %d failed\n", attempt + 1);
+            if (wifiDownSince == 0) {
+                wifiDownSince = millis();
+                logf("WiFi lost, requesting portal\n");
+                portalShouldOpen = true;
             }
-            if (WiFi.status() != WL_CONNECTED) {
-                logf("WiFi reconnect failed after 3 attempts\n");
+        } else if (wifiDownSince != 0) {
+            logf("WiFi reconnected: %s\n", WiFi.localIP().toString().c_str());
+            wifiDownSince = 0;
+            if (portalOpen) {
+                portalOpen = false;
+                portalShouldOpen = false;
+                logf("Closing AP after reconnect\n");
             }
+            MDNS.begin(cfgHostname.c_str());
+            MDNS.addService("http", "tcp", 80);
         }
         fetchDepartures();
         fetchOebbDepartures();
@@ -2568,10 +2614,16 @@ void dataTask(void* param) {
             checkOtaUpdate();
             lastOtaCheck = millis();
         }
-        // Wait 20s, but wake early if config changed
+        // Wait 20s, but wake early if config changed or WiFi drops
         for (int t = 0; t < 40; t++) {  // 40 × 500ms = 20s
             if (configChanged) {
                 configChanged = false;
+                break;
+            }
+            if (WiFi.status() != WL_CONNECTED && wifiDownSince == 0) {
+                wifiDownSince = millis();
+                logf("WiFi lost (sleep), requesting portal\n");
+                portalShouldOpen = true;
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(500));
@@ -2609,7 +2661,6 @@ void checkResetButton() {
             tft.setCursor(10, 70);
             tft.print("Factory Reset...");
             SPIFFS.remove(CONFIG_PATH);
-            WiFiManager wm;
             wm.resetSettings();
             delay(500);
             ESP.restart();
@@ -2795,6 +2846,27 @@ void setup() {
 
 void loop() {
     server.handleClient();
+    if (portalShouldOpen && !portalOpen) {
+        portalShouldOpen = false;
+        // Open raw soft AP without touching STA reconnect.
+        // DNS server redirects all domains → 192.168.4.1 so phones auto-open captive portal.
+        // WiFiManager is NOT involved here — it would call WiFi.disconnect() and break reconnect.
+        WiFi.mode(WIFI_AP_STA);
+        WiFi.softAP("LineTracker");
+        WiFi.begin(); // restart STA with saved NVS credentials
+        apDns.start(53, "*", WiFi.softAPIP());
+        portalOpen = true;
+        logf("AP opened at %s, STA reconnecting\n", WiFi.softAPIP().toString().c_str());
+    }
+    if (portalOpen) {
+        apDns.processNextRequest();
+        if (WiFi.status() == WL_CONNECTED) {
+            apDns.stop();
+            WiFi.softAPdisconnect(true);
+            portalOpen = false;
+            logf("AP closed after reconnect\n");
+        }
+    }
     checkResetButton();
     delay(5);
 }
