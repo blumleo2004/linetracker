@@ -49,7 +49,7 @@ String getLogContents() {
 }
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.1.7"
+#define FW_VERSION "1.1.8"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -64,7 +64,8 @@ static uint16_t AMBER_DIM;   // dim amber for separators/glow
 
 // ── Config ───────────────────────────────────────────────────────────
 static const char* CONFIG_PATH = "/config.json";
-static const char* WIFI_RESET_FLAG = "/wifi_reset";
+static const char* WIFI_RESET_FLAG      = "/wifi_reset";
+static const char* WIFI_CONFIGURED_FLAG = "/wifi_ok";
 
 // CSV cache on SPIFFS
 static const char* CACHE_HALT_PATH   = "/halt.csv";
@@ -335,13 +336,28 @@ bool downloadCsvToCache(const char* url, const char* path) {
 
     WiFiClient* stream = http.getStreamPtr();
     uint8_t buf[512];
-    while (stream->available()) {
-        int len = stream->readBytes(buf, sizeof(buf));
-        f.write(buf, len);
+    int total = http.getSize(); // -1 if chunked/unknown
+    int received = 0;
+    while (http.connected() && (total < 0 || received < total)) {
+        int avail = stream->available();
+        if (avail > 0) {
+            int len = stream->readBytes(buf, min(avail, (int)sizeof(buf)));
+            f.write(buf, len);
+            received += len;
+        } else {
+            delay(1);
+        }
     }
     f.close();
     http.end();
-    return true;
+    // If content-length was known and we got less, the download was truncated
+    if (total > 0 && received < total) {
+        SPIFFS.remove(path);
+        logf("Download truncated %s: %d/%d bytes\n", path, received, total);
+        return false;
+    }
+    logf("Downloaded %s: %d bytes\n", path, received);
+    return received > 0;
 }
 
 bool isCacheValid() {
@@ -867,6 +883,9 @@ label{display:block}
 .footer{text-align:center;margin:24px 0 12px;font-size:11px;color:#444;line-height:1.8}
 .footer b{color:#ffbf00}
 .footer a{color:#555}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a8f3c;color:#fff;padding:12px 24px;border-radius:12px;font-weight:600;font-size:14px;z-index:999;white-space:nowrap;animation:tin .25s,tout .4s 2.1s forwards}
+@keyframes tin{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+@keyframes tout{to{opacity:0}}
 .time-row{display:flex;gap:8px;margin:10px 0;font-size:13px;color:#888;align-items:center}
 .options-col{margin-top:16px;display:flex;flex-direction:column;gap:10px}
 .stn-count{color:#888;font-size:12px;margin:4px 0}
@@ -906,7 +925,9 @@ void handleRoot() {
 
 
     if (server.hasArg("saved")) {
-        html += "<div class='msg'>Linien gespeichert!</div>";
+        html += "<div class='toast'>Gespeichert</div>"
+                "<script>setTimeout(function(){var t=document.querySelector('.toast');if(t)t.remove()},2500);"
+                "history.replaceState(null,'','/');</script>";
     }
 
     html += "<div class='card'><h2>Aktive Linien</h2>";
@@ -1472,6 +1493,7 @@ void handleFactoryReset() {
     SPIFFS.remove(CACHE_STEIGE_PATH);
     SPIFFS.remove(CACHE_LINIEN_PATH);
     SPIFFS.remove(CACHE_TS_PATH);
+    SPIFFS.remove(WIFI_CONFIGURED_FLAG);
 
     WiFiManager wm;
     wm.resetSettings();
@@ -1757,7 +1779,7 @@ void showWifiSetupScreen(const char* subtitle) {
 
     tft.setTextColor(AMBER_DIM, BG_COLOR);
     tft.setTextSize(1);
-    const char* hint = "Nur 2.4 GHz | Timeout: 3 Min";
+    const char* hint = "Nur 2.4 GHz WLAN unterstuetzt";
     tft.setCursor((320 - tft.textWidth(hint)) / 2, 128);
     tft.print(hint);
 
@@ -1781,38 +1803,34 @@ void setupWiFi() {
         SPIFFS.remove(WIFI_RESET_FLAG);
     }
 
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
+
+    // Write wifi_ok after any successful portal save (first setup or WiFi change)
+    wm.setSaveConfigCallback([]() {
+        File f = SPIFFS.open(WIFI_CONFIGURED_FLAG, "w");
+        if (f) { f.print("1"); f.close(); }
+    });
+
     if (wifiResetRequested) {
+        // Web UI "WLAN ändern" button: change WiFi via blocking portal
         showWifiSetupScreen("WLAN ändern");
+        wm.setSaveConnectTimeout(30);
         wm.setConfigPortalTimeout(180);
-        if (!wm.startConfigPortal("LineTracker")) {
-            tft.fillRect(0, 135, 320, 25, BG_COLOR);
-            tft.setTextColor(AMBER_DIM, BG_COLOR);
-            tft.setTextFont(1);
-            tft.setTextSize(1);
-            const char* msg = "Verbinde mit altem WLAN...";
-            tft.setCursor((320 - tft.textWidth(msg)) / 2, 140);
-            tft.print(msg);
-            WiFi.begin();
-            unsigned long start = millis();
-            while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-                delay(500);
-            }
-            if (WiFi.status() != WL_CONNECTED) {
-                ESP.restart();
-            }
-        }
+        wm.startConfigPortal("LineTracker");
+        // After portal, continue — dataTask handles reconnect
+    } else if (!SPIFFS.exists(WIFI_CONFIGURED_FLAG)) {
+        // No wifi_ok flag → never been set up → first-time setup
+        showWifiSetupScreen("Ersteinrichtung");
+        wm.setSaveConnectTimeout(30);
+        wm.setConfigPortalTimeout(0); // no timeout for first setup
+        wm.startConfigPortal("LineTracker");
     } else {
-        wm.setAPCallback([](WiFiManager* mgr) {
-            showWifiSetupScreen("Ersteinrichtung");
-        });
-        WiFi.setAutoReconnect(true);
-        WiFi.persistent(true);
-        wm.setConnectTimeout(15);         // 15s for saved WiFi (was 5s)
-        wm.setSaveConnectTimeout(30);     // wait 30s when user submits credentials in portal
-        wm.setConfigPortalTimeout(180);
-        if (!wm.autoConnect("LineTracker")) {
-            delay(3000);
-            ESP.restart();
+        // Already configured — try to connect, dataTask handles if WiFi is down
+        WiFi.begin();
+        unsigned long start = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+            delay(200);
         }
     }
 }
@@ -2299,17 +2317,6 @@ void drawDisplay() {
         int dirLineH = 7 * DIR_SZ;
         int dirCharW = 6 * DIR_SZ;
 
-        // ── IP address (tiny, top-right, always visible as fallback) ──
-        {
-            String ip = WiFi.localIP().toString();
-            sprite.setTextFont(1);
-            sprite.setTextSize(1);
-            sprite.setTextColor(tft.color565(25, 20, 5), BG_COLOR);
-            int iw = sprite.textWidth(ip);
-            sprite.setCursor(SCREEN_W - iw - 2, 2);
-            sprite.print(ip);
-        }
-
         // ── Dynamic column widths ──
         sprite.setTextSize(NAME_SZ);
         int maxLeftW = 0;
@@ -2533,6 +2540,17 @@ void drawDisplay() {
             tickerOffset += 1;
             if (tickerOffset >= textW) tickerOffset = 0;
         }
+
+        // ── IP address — drawn last so it's always on top ──
+        {
+            String ip = WiFi.localIP().toString();
+            sprite.setTextFont(1);
+            sprite.setTextSize(1);
+            sprite.setTextColor(tft.color565(25, 20, 5), BG_COLOR);
+            int iw = sprite.textWidth(ip);
+            sprite.setCursor(SCREEN_W - iw - 2, 1);
+            sprite.print(ip);
+        }
     }
     xSemaphoreGive(dataMutex);
 
@@ -2643,60 +2661,6 @@ void displayTask(void* param) {
     }
 }
 
-// ── Reset button ─────────────────────────────────────────────────────
-// BOOT 3s = WiFi reset (open portal, keep lines)
-// BOOT 10s = Factory reset (erase everything)
-void checkResetButton() {
-    static unsigned long pressStart = 0;
-    static bool actionTaken = false;
-    if (digitalRead(0) == LOW) {
-        if (pressStart == 0) { pressStart = millis(); actionTaken = false; }
-        unsigned long held = millis() - pressStart;
-        if (held > 10000 && !actionTaken) {
-            actionTaken = true;
-            tft.fillScreen(TFT_RED);
-            tft.setTextColor(TFT_WHITE);
-            tft.setTextFont(1);
-            tft.setTextSize(2);
-            tft.setCursor(10, 70);
-            tft.print("Factory Reset...");
-            SPIFFS.remove(CONFIG_PATH);
-            wm.resetSettings();
-            delay(500);
-            ESP.restart();
-        } else if (held > 5000) {
-            tft.fillScreen(TFT_RED);
-            tft.setTextColor(TFT_WHITE);
-            tft.setTextFont(1);
-            tft.setTextSize(2);
-            tft.setCursor(10, 60);
-            tft.print("  Halten: Reset");
-            tft.setCursor(10, 90);
-            tft.print("  Loslassen: WiFi");
-        } else if (held > 3000) {
-            tft.fillScreen(BG_COLOR);
-            tft.setTextColor(AMBER, BG_COLOR);
-            tft.setTextFont(1);
-            tft.setTextSize(2);
-            tft.setCursor(10, 60);
-            tft.print("  Loslassen: WiFi Reset");
-            tft.setCursor(10, 90);
-            tft.print("  Halten: Factory Reset");
-        }
-    } else {
-        if (pressStart > 0 && !actionTaken) {
-            unsigned long held = millis() - pressStart;
-            if (held > 3000) {
-                // WiFi reset — keep line config, open portal
-                File f = SPIFFS.open(WIFI_RESET_FLAG, "w");
-                if (f) { f.print("1"); f.close(); }
-                ESP.restart();
-            }
-        }
-        pressStart = 0;
-        actionTaken = false;
-    }
-}
 
 // ── Setup & Loop ─────────────────────────────────────────────────────
 void setup() {
@@ -2771,11 +2735,13 @@ void setup() {
     loadLineDirections();
     ledcWrite(0, cfgBrightness);
 
-    // Show loading status below splash
-    tft.setTextColor(AMBER_DIM, BG_COLOR);
-    tft.setTextSize(1);
-    tft.setCursor((320 - tft.textWidth("Verbinde WiFi...")) / 2, 140);
-    tft.print("Verbinde WiFi...");
+    // Show loading status below splash (skip if not yet configured — goes straight to setup screen)
+    if (SPIFFS.exists(WIFI_CONFIGURED_FLAG)) {
+        tft.setTextColor(AMBER_DIM, BG_COLOR);
+        tft.setTextSize(1);
+        tft.setCursor((320 - tft.textWidth("Verbinde WiFi...")) / 2, 140);
+        tft.print("Verbinde WiFi...");
+    }
 
     setupWiFi();
 
@@ -2867,6 +2833,5 @@ void loop() {
             logf("AP closed after reconnect\n");
         }
     }
-    checkResetButton();
     delay(5);
 }
