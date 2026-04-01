@@ -98,7 +98,7 @@ void saveCrashInfo() {
 }
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.1.9"
+#define FW_VERSION "1.2.0"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -240,6 +240,7 @@ static int  cfgNightTo        = -1;    // night mode end hour (0-23)
 static int  cfgNightBright    = 20;    // backlight during night mode
 static bool   cfgShowNext        = false; // show next departure below main countdown
 static bool   cfgShowDisruptions = false; // show WL disruption ticker at bottom
+static bool   cfgSortByTime      = true;  // sort display slots by countdown
 static String cfgHostname        = "";    // mDNS hostname, generated from MAC on first boot
 
 struct ConfigLine {
@@ -257,6 +258,22 @@ struct OebbStation {
 };
 static std::vector<OebbStation> cfgOebb;
 
+// Watch group: N selected lines merged into N display slots
+struct WatchGroupEntry {
+    String source;       // "wl" or "oebb"
+    String rbl;          // WL: platform ID
+    String oebbStation;  // ÖBB: station name
+    String lineName;
+    String towards;
+    String type;
+};
+struct WatchGroup {
+    String label;
+    int    maxDepartures; // 1-5
+    std::vector<WatchGroupEntry> entries;
+};
+static std::vector<WatchGroup> cfgWatchGroups;
+
 bool loadConfig() {
     if (!SPIFFS.exists(CONFIG_PATH)) return false;
     File f = SPIFFS.open(CONFIG_PATH, "r");
@@ -267,6 +284,7 @@ bool loadConfig() {
 
     cfgLines.clear();
     cfgOebb.clear();
+    cfgWatchGroups.clear();
 
     if (doc["lines"].is<JsonArray>()) {
         for (JsonObject line : doc["lines"].as<JsonArray>()) {
@@ -297,6 +315,27 @@ bool loadConfig() {
             if (os.stationName.length() > 0) cfgOebb.push_back(os);
         }
     }
+    if (doc["watch_groups"].is<JsonArray>()) {
+        for (JsonObject wg : doc["watch_groups"].as<JsonArray>()) {
+            WatchGroup g;
+            g.label          = wg["label"] | "";
+            g.maxDepartures  = wg["max"] | 2;
+            if (wg["entries"].is<JsonArray>()) {
+                for (JsonObject e : wg["entries"].as<JsonArray>()) {
+                    WatchGroupEntry en;
+                    en.source      = e["src"] | "wl";
+                    en.rbl         = e["rbl"] | "";
+                    en.oebbStation = e["station"] | "";
+                    en.lineName    = e["line"] | "";
+                    en.towards     = e["towards"] | "";
+                    en.type        = e["type"] | "";
+                    if (en.lineName.length() > 0) g.entries.push_back(en);
+                }
+            }
+            if (!g.entries.empty()) cfgWatchGroups.push_back(g);
+        }
+    }
+
     cfgRotateSec       = doc["rotate_sec"]        | 5;
     cfgBrightness      = doc["brightness"]        | 255;
     cfgNightFrom       = doc["night_from"]        | -1;
@@ -304,6 +343,7 @@ bool loadConfig() {
     cfgNightBright     = doc["night_bright"]      | 20;
     cfgShowNext        = doc["show_next"]         | false;
     cfgShowDisruptions = doc["show_disruptions"]  | false;
+    cfgSortByTime      = doc["sort_by_time"]      | true;
     cfgHostname        = doc["hostname"]          | "";
     if (cfgRotateSec   < 2)   cfgRotateSec   = 2;
     if (cfgRotateSec   > 60)  cfgRotateSec   = 60;
@@ -312,7 +352,7 @@ bool loadConfig() {
     if (cfgNightBright < 0)   cfgNightBright = 0;
     if (cfgNightBright > 255) cfgNightBright = 255;
 
-    return cfgLines.size() > 0 || cfgOebb.size() > 0;
+    return cfgLines.size() > 0 || cfgOebb.size() > 0 || !cfgWatchGroups.empty();
 }
 
 void saveConfig() {
@@ -334,6 +374,22 @@ void saveConfig() {
         obj["line"]    = os.line;
         obj["towards"] = os.towards;
     }
+    JsonArray wgArr = doc["watch_groups"].to<JsonArray>();
+    for (auto& g : cfgWatchGroups) {
+        JsonObject obj = wgArr.add<JsonObject>();
+        obj["label"] = g.label;
+        obj["max"]   = g.maxDepartures;
+        JsonArray eArr = obj["entries"].to<JsonArray>();
+        for (auto& e : g.entries) {
+            JsonObject eo = eArr.add<JsonObject>();
+            eo["src"]     = e.source;
+            eo["line"]    = e.lineName;
+            eo["towards"] = e.towards;
+            eo["type"]    = e.type;
+            if (e.source == "wl")   eo["rbl"]     = e.rbl;
+            else                    eo["station"]  = e.oebbStation;
+        }
+    }
     doc["rotate_sec"]       = cfgRotateSec;
     doc["brightness"]       = cfgBrightness;
     doc["night_from"]       = cfgNightFrom;
@@ -341,6 +397,7 @@ void saveConfig() {
     doc["night_bright"]     = cfgNightBright;
     doc["show_next"]        = cfgShowNext;
     doc["show_disruptions"] = cfgShowDisruptions;
+    doc["sort_by_time"]     = cfgSortByTime;
     doc["hostname"]         = cfgHostname;
     serializeJson(doc, f);
     f.close();
@@ -353,6 +410,7 @@ struct Departure {
     String type;
     int    countdown;
     bool   realtime;
+    int    watchIdx = -1; // -1 = normal, >=0 = station watch entry index
 };
 
 static std::vector<Departure> departures;     // all departures (raw)
@@ -883,78 +941,84 @@ const char HTML_HEAD[] PROGMEM = R"rawliteral(
 <title>LineTracker</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;background:#0a0a16;color:#e8e8f0;padding:0 16px 24px;max-width:520px;margin:0 auto;-webkit-font-smoothing:antialiased;line-height:1.5}
-header{text-align:center;padding:24px 0 16px}
-header h1{color:#ffbf00;font-size:1.7em;letter-spacing:1.5px;margin:0;font-weight:700}
-header p{color:#555;font-size:11px;margin-top:4px;letter-spacing:.5px}
-h2{color:#ffbf00;font-size:.85em;margin:16px 0 12px;letter-spacing:1px;text-transform:uppercase;font-weight:600}
-.card{background:#12122a;border:1px solid rgba(255,255,255,.06);border-radius:16px;padding:18px;margin-bottom:16px;box-shadow:0 4px 20px rgba(0,0,0,.4)}
-input[type=text],input[type=number]{width:100%;padding:14px 16px;border-radius:12px;border:1px solid rgba(255,255,255,.1);background:#0a0a1e;color:#fff;font-size:16px;transition:border .2s,box-shadow .2s}
-input[type=text]:focus,input[type=number]:focus{outline:none;border-color:#ffbf00;box-shadow:0 0 0 3px rgba(255,191,0,.15)}
-input[type=number]{width:70px;padding:10px;text-align:center}
-input[type=range]{width:100%;margin:10px 0;accent-color:#ffbf00;height:6px;cursor:pointer}
-button{background:#e94560;color:#fff;border:none;padding:14px 24px;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;width:100%;margin-top:10px;transition:transform .1s,opacity .15s;-webkit-tap-highlight-color:transparent}
-button:hover{opacity:.9;transform:translateY(-1px)}
-button:active{transform:scale(.98);opacity:.8}
-button.add{background:#1a8f3c}
-.line-item{display:flex;align-items:center;gap:12px;padding:14px 10px;border-bottom:1px solid rgba(255,255,255,.04);transition:background .15s}
+body{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;background:#0d0d0d;color:#f0f0f0;padding:0 14px 32px;max-width:480px;margin:0 auto;-webkit-font-smoothing:antialiased;line-height:1.5}
+.hdr{display:flex;align-items:center;justify-content:space-between;padding:20px 0 14px}
+.hdr h1{font-size:1.5em;font-weight:700;letter-spacing:2px;color:#f5c400;font-family:'Courier New',Courier,monospace}
+.hdr a{color:#686868;font-size:22px;text-decoration:none;padding:6px;-webkit-tap-highlight-color:transparent}
+.hdr a:hover{color:#f5c400}
+.card{background:#171717;border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:16px;margin-bottom:12px;box-shadow:0 4px 24px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.04)}
+details>summary{cursor:pointer;list-style:none;padding:2px 0;display:flex;align-items:center;justify-content:space-between;user-select:none;-webkit-tap-highlight-color:transparent}
+details>summary::-webkit-details-marker{display:none}
+details>summary::after{content:'›';color:#686868;font-size:20px;line-height:1;transition:transform .2s;flex-shrink:0;margin-left:8px}
+details[open]>summary::after{transform:rotate(90deg)}
+details>div{margin-top:10px}
+h2{color:#f5c400;font-size:.75em;letter-spacing:1.5px;text-transform:uppercase;font-weight:700;flex:1}
+.count{font-family:'Courier New',Courier,monospace;font-size:.7em;color:#686868;margin-left:6px;font-weight:400}
+.line-item{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid rgba(255,255,255,.05)}
 .line-item:last-child{border-bottom:none}
-.badge{display:inline-flex;align-items:center;justify-content:center;padding:6px 14px;border-radius:8px;color:#fff;font-weight:700;min-width:48px;text-align:center;font-size:14px;letter-spacing:.5px;flex-shrink:0}
-.badge.metro{background:#c9935a}
-.badge.tram{background:#e94560}
-.badge.bus{background:#2d7cd6}
-.badge.train{background:#388e3c}
-.badge.unknown{background:#555}
+.badge{font-family:'Courier New',Courier,monospace;display:inline-flex;align-items:center;justify-content:center;padding:5px 10px;border-radius:4px;color:#0d0d0d;font-weight:700;min-width:44px;text-align:center;font-size:13px;letter-spacing:.5px;flex-shrink:0}
+.badge.metro{background:#f5c400}
+.badge.tram{background:#e53935;color:#fff}
+.badge.bus{background:#4a90e2;color:#fff}
+.badge.train{background:#4a90e2;color:#fff}
+.badge.unknown{background:#444;color:#fff}
 .dir{flex:1;font-size:14px;line-height:1.4;min-width:0}
-.stop{font-size:12px;color:#666;margin-top:3px}
-input[type=checkbox]{width:22px;height:22px;accent-color:#ffbf00;cursor:pointer;flex-shrink:0}
-.status{text-align:center;color:#666;padding:24px 8px;font-size:14px;line-height:1.6}
-.rm{background:#c0392b;width:38px;min-width:38px;height:38px;padding:0;font-size:18px;margin:0;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
-.msg{background:#1a8f3c;border-radius:12px;padding:14px;margin:10px 0;text-align:center;font-weight:600}
-.letters{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin:12px 0}
-.letters a{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;background:#12122a;color:#ffbf00;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;border:1px solid rgba(255,255,255,.06);transition:all .15s;-webkit-tap-highlight-color:transparent}
-.letters a:hover,.letters a.act{background:#ffbf00;color:#0a0a16;border-color:#ffbf00}
-.stn{display:block;padding:13px 10px;border-bottom:1px solid rgba(255,255,255,.04);color:#e8e8f0;text-decoration:none;font-size:15px;transition:all .15s;border-radius:8px}
-.stn:hover{background:rgba(255,191,0,.05);padding-left:16px}
-label{display:block}
-.setting{margin-top:14px}
-.setting-label{font-size:13px;color:#888;display:flex;align-items:center;justify-content:space-between}
-.setting-label b{color:#e8e8f0}
-.btn-secondary{background:#1e1e3a;color:#ccc;font-weight:500}
-.btn-secondary:hover{background:#282848}
-.btn-warn{background:#e67e22}
-.btn-danger{background:#c0392b}
-.btn-info{background:#1a5276}
-.info-text{font-size:13px;color:#888;margin-bottom:10px}
-.info-text b{color:#e8e8f0}
-.hint{font-size:12px;color:#555;margin-bottom:10px}
+.stop{font-size:11px;color:#686868;margin-top:2px;font-family:'Courier New',Courier,monospace}
+input[type=text],input[type=number]{width:100%;padding:12px 14px;border-radius:6px;border:1px solid rgba(255,255,255,.1);background:#1f1f1f;color:#f0f0f0;font-size:16px;font-family:inherit;transition:border .15s,box-shadow .15s}
+input[type=text]:focus,input[type=number]:focus{outline:none;border-color:#f5c400;box-shadow:0 0 0 2px rgba(245,196,0,.2)}
+input[type=number]{width:70px;padding:10px;text-align:center}
+input[type=range]{width:100%;margin:8px 0;accent-color:#f5c400;cursor:pointer}
+input[type=checkbox]{width:20px;height:20px;accent-color:#f5c400;cursor:pointer;flex-shrink:0}
+select{padding:10px 12px;border-radius:6px;border:1px solid rgba(255,255,255,.1);background:#1f1f1f;color:#f0f0f0;font-size:14px;font-family:inherit}
+button{background:#f5c400;color:#0d0d0d;border:none;padding:13px 20px;border-radius:6px;font-size:14px;font-weight:700;font-family:inherit;cursor:pointer;width:100%;margin-top:10px;letter-spacing:.5px;transition:opacity .15s,transform .1s;-webkit-tap-highlight-color:transparent}
+button:hover{opacity:.88;transform:translateY(-1px)}
+button:active{transform:scale(.98);opacity:.8}
+button.add{background:#2e7d32;color:#fff}
+.rm{background:transparent;border:1px solid rgba(229,57,53,.5);color:#e53935;width:34px;min-width:34px;height:34px;padding:0;font-size:14px;margin:0;border-radius:4px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .15s,color .15s,border-color .15s}
+.rm:hover{background:#e53935;color:#fff;border-color:#e53935}
+.btn-secondary{background:#252525;color:#ccc;font-weight:500;border:1px solid rgba(255,255,255,.1)}
+.btn-secondary:hover{background:#2e2e2e;opacity:1;transform:none}
+.btn-warn{background:#e65100;color:#fff}
+.btn-danger{background:#e53935;color:#fff}
+.btn-info{background:#1a3a5c;color:#4a90e2;border:1px solid rgba(74,144,226,.3)}
+.btn-back{background:none;color:#686868;border:none;width:auto;padding:4px 0;font-size:13px;margin:0 0 16px;font-weight:400;letter-spacing:0}
+.btn-back:hover{color:#f5c400;transform:none;opacity:1}
+.status{text-align:center;color:#686868;padding:20px 8px;font-size:13px;line-height:1.6}
+.msg{background:#1b5e20;border-radius:6px;padding:12px;margin:8px 0;text-align:center;font-weight:600;font-size:14px}
+.setting{margin-top:12px}
+.setting-label{font-size:12px;color:#686868;display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}
+.setting-label b{color:#f0f0f0;font-family:'Courier New',Courier,monospace}
+.info-text{font-size:13px;color:#686868;margin-bottom:8px}
+.info-text b{color:#f0f0f0}
+.hint{font-size:11px;color:#444;margin-bottom:8px}
 .check-label{font-size:13px;color:#888;display:flex;align-items:center;gap:8px}
 .check-label input{width:auto;flex-shrink:0}
-.footer{text-align:center;margin:24px 0 12px;font-size:11px;color:#444;line-height:1.8}
-.footer b{color:#ffbf00}
-.footer a{color:#555}
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a8f3c;color:#fff;padding:12px 24px;border-radius:12px;font-weight:600;font-size:14px;z-index:999;white-space:nowrap;animation:tin .25s,tout .4s 2.1s forwards}
-@keyframes tin{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+.footer{text-align:center;margin:20px 0 8px;font-size:11px;color:#444;line-height:1.8}
+.footer b{color:#f5c400;font-family:'Courier New',Courier,monospace}
+.footer a{color:#444}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#2e7d32;color:#fff;padding:10px 22px;border-radius:6px;font-weight:600;font-size:13px;z-index:999;white-space:nowrap;animation:tin .2s,tout .35s 2.1s forwards}
+@keyframes tin{from{opacity:0;transform:translateX(-50%) translateY(6px)}to{opacity:1;transform:translateX(-50%)}}
 @keyframes tout{to{opacity:0}}
-.time-row{display:flex;gap:8px;margin:10px 0;font-size:13px;color:#888;align-items:center}
-.options-col{margin-top:16px;display:flex;flex-direction:column;gap:10px}
-.stn-count{color:#888;font-size:12px;margin:4px 0}
+.time-row{display:flex;gap:8px;margin:8px 0;font-size:13px;color:#686868;align-items:center}
+.options-col{margin-top:12px;display:flex;flex-direction:column;gap:8px}
+.stn-count{color:#686868;font-size:11px;margin:3px 0}
+.letters{display:flex;flex-wrap:wrap;gap:5px;justify-content:center;margin:10px 0}
+.letters a{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;background:#1f1f1f;color:#f5c400;border-radius:4px;text-decoration:none;font-weight:700;font-size:13px;font-family:'Courier New',Courier,monospace;border:1px solid rgba(255,255,255,.08);transition:all .15s;-webkit-tap-highlight-color:transparent}
+.letters a:hover,.letters a.act{background:#f5c400;color:#0d0d0d;border-color:#f5c400}
+.stn{display:block;padding:12px 8px;border-bottom:1px solid rgba(255,255,255,.04);color:#f0f0f0;text-decoration:none;font-size:14px;transition:all .15s;border-radius:4px}
+.stn:hover{background:rgba(245,196,0,.06);padding-left:14px}
+.search-row{display:flex;gap:8px}
+.search-row input{flex:1}
+.search-row button{width:auto;margin:0;padding:0 18px}
+.sep{border:none;border-top:1px solid rgba(255,255,255,.06);margin:4px 0}
 @media(max-width:380px){
-body{padding:0 10px 20px}
-.card{padding:14px;border-radius:12px}
-button{padding:12px 16px;font-size:14px}
-.badge{padding:5px 10px;font-size:12px;min-width:40px}
-.line-item{gap:8px;padding:12px 6px}
-.letters a{width:32px;height:32px;font-size:12px}
-header h1{font-size:1.4em}
-}
-@media(min-width:600px){
-body{padding:0 24px 32px}
-.card{padding:22px}
-.line-item{padding:16px 12px}
+body{padding:0 10px 24px}
+.card{padding:12px}
+button{padding:11px 14px;font-size:13px}
+.badge{min-width:36px;font-size:12px}
+.hdr h1{font-size:1.2em}
 }
 </style></head><body>
-<header><h1>LineTracker</h1><p>by Leo Blum</p></header>
 )rawliteral";
 
 String badgeClassForType(const String& type) {
@@ -970,68 +1034,13 @@ void sendHtml(const String& html) {
     server.send(200, "text/html; charset=utf-8", html);
 }
 
-void handleRoot() {
+void handleSettingsPage() {
     LOG_REQ();
-    unsigned long t0 = millis();
     String html = FPSTR(HTML_HEAD);
-    logf("[root] HTML_HEAD: %lums\n", millis()-t0);
+    html += "<div class='hdr'><a href='/' class='btn-back' style='font-size:20px;color:#686868;text-decoration:none'>&#8592;</a><h1 style='font-size:1.1em;letter-spacing:1px'>EINSTELLUNGEN</h1><span style='width:34px'></span></div>";
 
-    if (server.hasArg("saved")) {
-        html += "<div class='toast'>Gespeichert</div>"
-                "<script>setTimeout(function(){var t=document.querySelector('.toast');if(t)t.remove()},2500);"
-                "history.replaceState(null,'','/');</script>";
-    }
-
-    html += "<div class='card'><h2>Aktive Linien</h2>";
-    if (cfgLines.empty()) {
-        html += "<p class='status'>Noch keine Linien konfiguriert.<br>Suche unten eine Station.</p>";
-    } else {
-        for (size_t i = 0; i < cfgLines.size(); i++) {
-            auto& cl = cfgLines[i];
-            html += "<div class='line-item'>";
-            html += "<span class='" + badgeClassForType(cl.type) + "'>" + cl.name + "</span>";
-            html += "<div class='dir'>" + cl.towards + "</div>";
-            html += "<form action='/remove' method='POST' style='margin:0'>";
-            html += "<input type='hidden' name='idx' value='" + String(i) + "'>";
-            html += "<button class='rm'>&#x2715;</button></form>";
-            html += "</div>";
-        }
-    }
-    html += "</div>";
-    logf("[root] active lines: %lums\n", millis()-t0);
-
-    html += "<div class='card'><h2>S-Bahn / Züge (ÖBB)</h2>";
-    if (cfgOebb.empty()) {
-        html += "<p class='status'>Noch keine ÖBB-Linien konfiguriert.</p>";
-    } else {
-        for (size_t i = 0; i < cfgOebb.size(); i++) {
-            auto& os = cfgOebb[i];
-            html += "<div class='line-item'>";
-            html += "<span class='badge train'>" + os.line + "</span>";
-            html += "<div><div class='dir'>" + os.towards + "</div>";
-            html += "<div class='stop'>" + os.stationName + "</div></div>";
-            html += "<form action='/oebb-remove' method='POST' style='margin:0'>";
-            html += "<input type='hidden' name='idx' value='" + String(i) + "'>";
-            html += "<button class='rm'>&#x2715;</button></form>";
-            html += "</div>";
-        }
-    }
-    html += "<form action='/oebb-search' method='GET'>";
-    html += "<input type='text' name='q' placeholder='z.B. Wien Rennweg, Meidling...'>";
-    html += "<button class='add' type='submit'>ÖBB-Station suchen</button>";
-    html += "</form></div>";
-    logf("[root] oebb card: %lums\n", millis()-t0);
-
-    html += "<div class='card'><h2>Station suchen</h2>";
-    html += "<form action='/search' method='GET'>";
-    html += "<input type='text' name='q' placeholder='z.B. Kutschkergasse, Volksoper...' autofocus>";
-    html += "<button type='submit'>Suchen</button>";
-    html += "</form>";
-    html += "<a href='/browse'><button class='btn-info' style='margin-top:8px'>Alle Stationen durchblättern</button></a>";
-    html += "</div>";
-    logf("[root] search card: %lums\n", millis()-t0);
-
-    html += "<div class='card'><h2>Einstellungen</h2>";
+    // ── Display settings ──────────────────────────────────────────────────
+    html += "<div class='card'>";
     html += "<form action='/settings' method='POST'>";
 
     html += "<div class='setting'><div class='setting-label'>Seitenwechsel <b id='v_rot'>" + String(cfgRotateSec) + " Sek</b></div>";
@@ -1040,61 +1049,164 @@ void handleRoot() {
     html += "<div class='setting'><div class='setting-label'>Helligkeit <b id='v_bri'>" + String(cfgBrightness * 100 / 255) + "%</b></div>";
     html += "<input type='range' name='brightness' min='10' max='255' value='" + String(cfgBrightness) + "' oninput=\"document.getElementById('v_bri').textContent=Math.round(this.value*100/255)+'%'\"></div>";
 
-    String nightFromVal = (cfgNightFrom >= 0) ? String(cfgNightFrom) : "22";
-    String nightToVal   = (cfgNightTo   >= 0) ? String(cfgNightTo)   : "7";
-    String nightBrVal   = String(cfgNightBright * 100 / 255);
-    bool nightOn = (cfgNightFrom >= 0);
-    html += "<div class='setting'>";
-    html += "<label class='check-label'><input type='checkbox' name='night_on' value='1' id='cb_night'";
-    if (nightOn) html += " checked";
-    html += " onchange=\"document.getElementById('night_opts').style.display=this.checked?'block':'none'\">Nachtmodus</label></div>";
-
-    html += "<div id='night_opts' style='display:";
-    html += nightOn ? "block" : "none";
-    html += "'>";
-    html += "<div class='time-row'>";
-    html += "<span>Von</span><input type='number' name='night_from' min='0' max='23' value='" + nightFromVal + "'>";
-    html += "<span>bis</span><input type='number' name='night_to' min='0' max='23' value='" + nightToVal + "'><span>Uhr</span></div>";
-    html += "<div class='setting-label'>Nacht-Helligkeit <b id='v_nbri'>" + nightBrVal + "%</b></div>";
-    html += "<input type='range' name='night_bright' min='0' max='100' value='" + nightBrVal + "' oninput=\"document.getElementById('v_nbri').textContent=this.value+'%'\">";
-    html += "</div>";
+    {
+        String nightFromVal = (cfgNightFrom >= 0) ? String(cfgNightFrom) : "22";
+        String nightToVal   = (cfgNightTo   >= 0) ? String(cfgNightTo)   : "7";
+        String nightBrVal   = String(cfgNightBright * 100 / 255);
+        bool nightOn = (cfgNightFrom >= 0);
+        html += "<div class='setting'>";
+        html += "<label class='check-label'><input type='checkbox' name='night_on' value='1' id='cb_night'";
+        if (nightOn) html += " checked";
+        html += " onchange=\"document.getElementById('night_opts').style.display=this.checked?'block':'none'\">Nachtmodus</label></div>";
+        html += "<div id='night_opts' style='display:" + String(nightOn ? "block" : "none") + "'>";
+        html += "<div class='time-row'><span>Von</span><input type='number' name='night_from' min='0' max='23' value='" + nightFromVal + "'>";
+        html += "<span>bis</span><input type='number' name='night_to' min='0' max='23' value='" + nightToVal + "'><span>Uhr</span></div>";
+        html += "<div class='setting-label'>Nacht-Helligkeit <b id='v_nbri'>" + nightBrVal + "%</b></div>";
+        html += "<input type='range' name='night_bright' min='0' max='100' value='" + nightBrVal + "' oninput=\"document.getElementById('v_nbri').textContent=this.value+'%'\">";
+        html += "</div>";
+    }
 
     html += "<div class='options-col'>";
     html += "<label class='check-label'><input type='checkbox' name='show_next' value='1'";
     if (cfgShowNext) html += " checked";
-    html += ">Nächste Abfahrt anzeigen</label>";
+    html += ">N&auml;chste Abfahrt anzeigen</label>";
     html += "<label class='check-label'><input type='checkbox' name='show_disruptions' value='1'";
     if (cfgShowDisruptions) html += " checked";
-    html += ">Störungsticker anzeigen</label>";
+    html += ">St&ouml;rungsticker anzeigen</label>";
+    html += "<label class='check-label'><input type='checkbox' name='sort_by_time' value='1'";
+    if (cfgSortByTime) html += " checked";
+    html += ">Display nach Zeit sortieren</label>";
     html += "</div>";
 
-    html += "<button class='btn-secondary' type='submit' style='margin-top:14px'>Speichern</button>";
-    html += "</form></div>";
-    logf("[root] settings card: %lums\n", millis()-t0);
-
-    html += "<div class='card'><h2>WiFi</h2>";
-    html += "<p class='info-text'>Verbunden mit: <b>" + WiFi.SSID() + "</b></p>";
-    html += "<p class='hint'>Nur 2,4 GHz Netzwerke werden unterstützt.</p>";
-    html += "<form action='/wifi-reset' method='POST' onsubmit=\"return confirm('WLAN wirklich ändern? Der Monitor öffnet kurz einen Hotspot zum Neu-Einrichten.')\">";
-    html += "<button class='btn-warn'>WLAN ändern</button>";
+    html += "<button type='submit' style='margin-top:16px'>Speichern</button>";
     html += "</form></div>";
 
-    html += "<div class='card'><h2>Zurücksetzen</h2>";
-    html += "<form action='/factory-reset' method='POST' onsubmit=\"return confirm('Wirklich alles löschen? Alle Linien und Einstellungen gehen verloren.')\">";
-    html += "<button class='btn-danger'>Werksreset</button>";
-    html += "</form></div>";
+    // ── System ────────────────────────────────────────────────────────────
+    html += "<div class='card'>";
+    html += "<h2 style='margin-bottom:12px'>System</h2>";
 
-    html += "<div class='card'><h2>Firmware</h2>";
+    html += "<p class='info-text'>WLAN: <b>" + WiFi.SSID() + "</b></p>";
+    html += "<p class='hint'>Nur 2,4 GHz Netzwerke werden unterst&uuml;tzt.</p>";
+    html += "<form action='/wifi-reset' method='POST' onsubmit=\"return confirm('WLAN wirklich \\u00e4ndern?')\">";
+    html += "<button class='btn-warn'>WLAN &auml;ndern</button></form>";
+
+    html += "<hr class='sep' style='margin:14px 0'>";
     html += "<p class='info-text'>Version: <b>v" + String(FW_VERSION) + "</b></p>";
     html += "<a href='/update'><button class='btn-info'>Nach Update suchen</button></a>";
+
+    html += "<hr class='sep' style='margin:14px 0'>";
+    html += "<form action='/factory-reset' method='POST' onsubmit=\"return confirm('Wirklich alles l\\u00f6schen?')\">";
+    html += "<button class='btn-danger'>Werksreset</button></form>";
+
+    html += "</div>";
+    html += "</body></html>";
+    sendHtml(html);
+}
+
+void handleRoot() {
+    LOG_REQ();
+    unsigned long t0 = millis();
+    String html = FPSTR(HTML_HEAD);
+    logf("[root] HTML_HEAD: %lums\n", millis()-t0);
+
+    // Header with gear icon
+    html += "<div class='hdr'><h1>LINETRACKER</h1><a href='/settings'>&#9881;</a></div>";
+
+    if (server.hasArg("saved")) {
+        html += "<div class='toast'>Gespeichert</div>"
+                "<script>setTimeout(function(){var t=document.querySelector('.toast');if(t)t.remove()},2500);"
+                "history.replaceState(null,'','/');</script>";
+    }
+
+    // ── Search card ──────────────────────────────────────────────────────
+    html += "<div class='card'>";
+    html += "<form action='/search' method='GET' class='search-row'>";
+    html += "<input type='text' name='q' placeholder='Station suchen...' autofocus>";
+    html += "<button type='submit' style='width:auto;margin:0;padding:0 16px'>&#8594;</button>";
+    html += "</form>";
+    html += "<a href='/browse'><button class='btn-secondary' style='margin-top:8px;font-size:12px;padding:10px'>Alle Stationen</button></a>";
     html += "</div>";
 
-    html += "<div class='footer'>";
-    html += "<b>LineTracker</b> by Leo Blum<br>";
-    html += "Daten: <a href='https://data.wien.gv.at'>Stadt Wien &ndash; data.wien.gv.at</a> (CC BY 4.0)";
-    html += " &middot; <a href='https://fahrplan.oebb.at'>ÖBB/SCOTTY</a>";
-    html += "</div>";
+    // ── WL Active Lines ──────────────────────────────────────────────────
+    {
+        int n = cfgLines.size();
+        html += "<div class='card'><details" + String(n > 0 ? " open" : "") + "><summary>";
+        html += "<h2>Wiener Linien<span class='count'>(" + String(n) + ")</span></h2></summary><div>";
+        if (n == 0) {
+            html += "<p class='status'>Noch keine Linien. Station oben suchen.</p>";
+        } else {
+            for (size_t i = 0; i < cfgLines.size(); i++) {
+                auto& cl = cfgLines[i];
+                html += "<div class='line-item'>";
+                html += "<span class='" + badgeClassForType(cl.type) + "'>" + cl.name + "</span>";
+                html += "<div class='dir'>" + cl.towards + "</div>";
+                html += "<form action='/remove' method='POST' style='margin:0'>";
+                html += "<input type='hidden' name='idx' value='" + String(i) + "'>";
+                html += "<button class='rm' type='button' onclick='confirmRm(this)'>&#x2715;</button></form>";
+                html += "</div>";
+            }
+        }
+        html += "</div></details></div>";
+    }
+    logf("[root] wl lines: %lums\n", millis()-t0);
 
+    // ── ÖBB ─────────────────────────────────────────────────────────────
+    {
+        int n = cfgOebb.size();
+        html += "<div class='card'><details" + String(n > 0 ? " open" : "") + "><summary>";
+        html += "<h2>S-Bahn &amp; Z&uuml;ge<span class='count'>(" + String(n) + ")</span></h2></summary><div>";
+        for (size_t i = 0; i < cfgOebb.size(); i++) {
+            auto& os = cfgOebb[i];
+            html += "<div class='line-item'>";
+            html += "<span class='badge train'>" + os.line + "</span>";
+            html += "<div><div class='dir'>" + os.towards + "</div>";
+            html += "<div class='stop'>" + os.stationName + "</div></div>";
+            html += "<form action='/oebb-remove' method='POST' style='margin:0'>";
+            html += "<input type='hidden' name='idx' value='" + String(i) + "'>";
+            html += "<button class='rm' type='button' onclick='confirmRm(this)'>&#x2715;</button></form>";
+            html += "</div>";
+        }
+        html += "<form action='/oebb-search' method='GET' class='search-row' style='margin-top:" + String(n > 0 ? "10" : "0") + "px'>";
+        html += "<input type='text' name='q' placeholder='ÖBB-Station suchen...'>";
+        html += "<button type='submit' class='add' style='width:auto;margin:0;padding:0 14px'>&#8594;</button>";
+        html += "</form>";
+        html += "</div></details></div>";
+    }
+    logf("[root] oebb card: %lums\n", millis()-t0);
+
+    // ── Watch Groups ─────────────────────────────────────────────────────
+    {
+        int n = cfgWatchGroups.size();
+        html += "<div class='card'><details" + String(n > 0 ? " open" : "") + "><summary>";
+        html += "<h2>Watch-Gruppen<span class='count'>(" + String(n) + ")</span></h2></summary><div>";
+        if (n == 0) {
+            html += "<p class='status'>Keine Gruppen.<br>In den Suchergebnissen 'Als Gruppe speichern' w&auml;hlen.</p>";
+        } else {
+            for (size_t i = 0; i < cfgWatchGroups.size(); i++) {
+                auto& g = cfgWatchGroups[i];
+                bool hasOebb = false;
+                for (auto& e : g.entries) if (e.source == "oebb") { hasOebb = true; break; }
+                html += "<div class='line-item'>";
+                html += "<span class='" + String(hasOebb ? "badge train" : "badge metro") + "'>" + String(g.entries.size()) + "</span>";
+                html += "<div><div class='dir'><a href='/watch-group-edit?idx=" + String(i) + "' style='color:#f5c400;text-decoration:none'>" + g.label + "</a></div>";
+                html += "<div class='stop'>n&auml;chste " + String(g.maxDepartures) + " Abfahrten</div></div>";
+                html += "<form action='/watch-group-remove' method='POST' style='margin:0'>";
+                html += "<input type='hidden' name='idx' value='" + String(i) + "'>";
+                html += "<button class='rm' type='button' onclick='confirmRm(this)'>&#x2715;</button></form>";
+                html += "</div>";
+            }
+        }
+        html += "</div></details></div>";
+    }
+    logf("[root] watch card: %lums\n", millis()-t0);
+
+    html += "<div class='footer'><b>LineTracker</b> &middot; Leo Blum<br>"
+            "<a href='https://data.wien.gv.at' style='color:#444'>data.wien.gv.at</a>"
+            " &middot; <a href='https://fahrplan.oebb.at' style='color:#444'>ÖBB/SCOTTY</a></div>";
+
+    html += "<script>function confirmRm(b){if(b._c){clearTimeout(b._t);b.closest('form').submit();return}"
+            "b._c=1;b.innerHTML='?';b.style.background='#e53935';b.style.borderColor='#e53935';b.style.color='#fff';"
+            "b._t=setTimeout(function(){b._c=0;b.innerHTML='&#x2715;';b.style.background='';b.style.borderColor='';b.style.color=''},3000)}</script>";
     html += "</body></html>";
     logf("[root] html built: %lums  size: %u bytes\n", millis()-t0, html.length());
     sendHtml(html);
@@ -1233,11 +1345,35 @@ void handleSearch() {
             html += "<div class='dir'>" + sr.towards + "</div>";
             html += "</div>";
         }
-        html += "<button class='add' type='submit'>Ausgewählte hinzufügen</button>";
+        html += "<button class='add' type='submit'>Einzeln hinzuf&uuml;gen</button>";
         html += "</form>";
+
+        // ── Watch Group option ────────────────────────────────────────
+        html += "<div style='border-top:1px solid rgba(255,255,255,.06);margin-top:16px;padding-top:12px'>";
+        html += "<p class='hint' style='margin-bottom:8px'>Oder: Auswahl als Gruppe &ndash; zeigt nur die n&auml;chsten N Abfahrten aller ausgew&auml;hlten Linien zusammen.</p>";
+
+        html += "<form action='/watch-group-save' method='POST'>";
+        html += "<input type='hidden' name='source' value='wl'>";
+        html += "<input type='hidden' name='label' value='" + query + "'>";
+        for (size_t i = 0; i < results.size(); i++) {
+            auto& sr = results[i];
+            String val = sr.rbl + "|" + sr.lineName + "|" + sr.towards + "|" + sr.type;
+            html += "<div class='line-item'>";
+            html += "<input type='checkbox' name='line' value='" + val + "'>";
+            html += "<span class='" + badgeClassForType(sr.type) + "'>" + sr.lineName + "</span>";
+            html += "<div class='dir'>" + sr.towards + "</div>";
+            html += "</div>";
+        }
+        html += "<div style='display:flex;gap:8px;align-items:center;margin-top:10px'>";
+        html += "<label style='font-size:13px;color:#888;white-space:nowrap'>N&auml;chste</label>";
+        html += "<input type='number' name='max' min='1' max='5' value='2' style='width:55px;padding:8px;text-align:center'>";
+        html += "<label style='font-size:13px;color:#888;white-space:nowrap'>Abfahrten anzeigen</label>";
+        html += "<button class='add' type='submit' style='flex:1;margin:0'>Als Gruppe speichern</button>";
+        html += "</div></form>";
+        html += "</div>";
     }
 
-    html += "<br><a href='/'><button>Zurück</button></a></div></body></html>";
+    html += "<br><a href='/'><button>Zur&uuml;ck</button></a></div></body></html>";
     sendHtml(html);
 }
 
@@ -1405,11 +1541,34 @@ void handleOebbSearch() {
             html += "<div class='dir'>" + c.second + "</div>";
             html += "</div>";
         }
-        html += "<button class='add' type='submit'>Ausgewählte hinzufügen</button>";
+        html += "<button class='add' type='submit'>Einzeln hinzuf&uuml;gen</button>";
         html += "</form>";
+
+        // ── Watch Group option ────────────────────────────────────────
+        html += "<div style='border-top:1px solid rgba(255,255,255,.06);margin-top:16px;padding-top:12px'>";
+        html += "<p class='hint' style='margin-bottom:8px'>Oder: Auswahl als Gruppe &ndash; zeigt nur die n&auml;chsten N Z&uuml;ge aller ausgew&auml;hlten Linien zusammen.</p>";
+        html += "<form action='/watch-group-save' method='POST'>";
+        html += "<input type='hidden' name='source' value='oebb'>";
+        html += "<input type='hidden' name='station' value='" + stationName + "'>";
+        html += "<input type='hidden' name='label' value='" + stationName + "'>";
+        for (auto& c : combos) {
+            String val = c.first + "|" + c.second;
+            html += "<div class='line-item'>";
+            html += "<input type='checkbox' name='entry' value='" + val + "'>";
+            html += "<span class='badge train'>" + c.first + "</span>";
+            html += "<div class='dir'>" + c.second + "</div>";
+            html += "</div>";
+        }
+        html += "<div style='display:flex;gap:8px;align-items:center;margin-top:10px'>";
+        html += "<label style='font-size:13px;color:#888;white-space:nowrap'>N&auml;chste</label>";
+        html += "<input type='number' name='max' min='1' max='5' value='2' style='width:55px;padding:8px;text-align:center'>";
+        html += "<label style='font-size:13px;color:#888;white-space:nowrap'>Z&uuml;ge anzeigen</label>";
+        html += "<button class='add' type='submit' style='flex:1;margin:0'>Als Gruppe speichern</button>";
+        html += "</div></form>";
+        html += "</div>";
     }
 
-    html += "<br><a href='/'><button>Zurück</button></a></div></body></html>";
+    html += "<br><a href='/'><button>Zur&uuml;ck</button></a></div></body></html>";
     sendHtml(html);
 }
 
@@ -1457,6 +1616,145 @@ void handleOebbRemove() {
     xSemaphoreGive(dataMutex);
     configChanged = true;
     server.sendHeader("Location", "/");
+    server.send(302);
+}
+
+void handleWatchGroupSave() {
+    // Builds a WatchGroup from POSTed checkboxes (same format as /save and /oebb-save)
+    String source  = server.arg("source");  // "wl" or "oebb"
+    String label   = server.arg("label");
+    int    maxN    = server.arg("max").toInt();
+    if (maxN < 1 || maxN > 5) maxN = 2;
+    if (source != "wl" && source != "oebb") { server.sendHeader("Location", "/"); server.send(302); return; }
+
+    WatchGroup g;
+    g.label          = label;
+    g.maxDepartures  = maxN;
+
+    if (source == "wl") {
+        // entries: "rbl|name|towards|type" (same as /save)
+        for (int i = 0; i < server.args(); i++) {
+            if (server.argName(i) != "line") continue;
+            String val = server.arg(i);
+            int p1 = val.indexOf('|'), p2 = val.indexOf('|', p1+1), p3 = val.indexOf('|', p2+1);
+            if (p1 < 0 || p2 < 0 || p3 < 0) continue;
+            WatchGroupEntry e;
+            e.source   = "wl";
+            e.rbl      = val.substring(0, p1);
+            e.lineName = val.substring(p1+1, p2);
+            e.towards  = val.substring(p2+1, p3);
+            e.type     = val.substring(p3+1);
+            if (e.rbl.length() > 0) g.entries.push_back(e);
+        }
+    } else {
+        // ÖBB entries: station + "line|towards" (same format as /oebb-save)
+        String stationName = server.arg("station");
+        for (int i = 0; i < server.args(); i++) {
+            if (server.argName(i) != "entry") continue;
+            String val = server.arg(i);
+            int sep = val.indexOf('|');
+            if (sep < 0) continue;
+            WatchGroupEntry e;
+            e.source      = "oebb";
+            e.oebbStation = stationName;
+            e.lineName    = val.substring(0, sep);
+            e.towards     = val.substring(sep+1);
+            e.type        = "ptTrainS";
+            if (e.lineName.length() > 0) g.entries.push_back(e);
+        }
+    }
+
+    if (g.entries.empty()) { server.sendHeader("Location", "/"); server.send(302); return; }
+    cfgWatchGroups.push_back(g);
+    saveConfig();
+    configChanged = true;
+    server.sendHeader("Location", "/?saved=1");
+    server.send(302);
+}
+
+void handleWatchGroupRemove() {
+    if (server.hasArg("idx")) {
+        int idx = server.arg("idx").toInt();
+        if (idx >= 0 && idx < (int)cfgWatchGroups.size())
+            cfgWatchGroups.erase(cfgWatchGroups.begin() + idx);
+    }
+    saveConfig();
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    departures.clear();
+    displaySlots.clear();
+    xSemaphoreGive(dataMutex);
+    configChanged = true;
+    server.sendHeader("Location", "/");
+    server.send(302);
+}
+
+void handleWatchGroupEdit() {
+    LOG_REQ();
+    int idx = server.arg("idx").toInt();
+    if (idx < 0 || idx >= (int)cfgWatchGroups.size()) {
+        server.sendHeader("Location", "/"); server.send(302); return;
+    }
+    WatchGroup& g = cfgWatchGroups[idx];
+    String html = FPSTR(HTML_HEAD);
+    html += "<div class='card'><h2>Gruppe bearbeiten</h2>";
+    html += "<form action='/watch-group-update' method='POST'>";
+    html += "<input type='hidden' name='idx' value='" + String(idx) + "'>";
+    html += "<div class='setting'><div class='setting-label'>Label</div>";
+    html += "<input type='text' name='label' value='" + g.label + "'></div>";
+    html += "<div class='setting'><div class='setting-label'>N&auml;chste</div>";
+    html += "<select name='max'>";
+    for (int n = 1; n <= 5; n++) {
+        html += "<option value='" + String(n) + "'";
+        if (n == g.maxDepartures) html += " selected";
+        html += ">" + String(n) + "</option>";
+    }
+    html += "</select></div>";
+    html += "<h3>Eintr&auml;ge</h3>";
+    for (size_t ei = 0; ei < g.entries.size(); ei++) {
+        auto& e = g.entries[ei];
+        String entryLabel = e.lineName + " &rarr; " + e.towards;
+        if (e.source == "oebb") entryLabel += " (" + e.oebbStation + ")";
+        html += "<label class='check-label'><input type='checkbox' name='keep' value='" + String(ei) + "' checked> " + entryLabel + "</label>";
+    }
+    html += "<button type='submit'>Speichern</button>";
+    html += "</form>";
+    html += "<a href='/'><button class='btn-info' style='margin-top:8px'>Abbrechen</button></a></div>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handleWatchGroupUpdate() {
+    int idx = server.arg("idx").toInt();
+    if (idx < 0 || idx >= (int)cfgWatchGroups.size()) {
+        server.sendHeader("Location", "/"); server.send(302); return;
+    }
+    WatchGroup& g = cfgWatchGroups[idx];
+    String newLabel = server.arg("label");
+    if (newLabel.length() > 0) g.label = newLabel;
+    int newMax = server.arg("max").toInt();
+    if (newMax >= 1 && newMax <= 5) g.maxDepartures = newMax;
+    std::vector<bool> keep(g.entries.size(), false);
+    for (int i = 0; i < server.args(); i++) {
+        if (server.argName(i) == "keep") {
+            int ei = server.arg(i).toInt();
+            if (ei >= 0 && ei < (int)g.entries.size()) keep[ei] = true;
+        }
+    }
+    std::vector<WatchGroupEntry> newEntries;
+    for (size_t ei = 0; ei < g.entries.size(); ei++)
+        if (keep[ei]) newEntries.push_back(g.entries[ei]);
+    if (newEntries.empty()) {
+        cfgWatchGroups.erase(cfgWatchGroups.begin() + idx);
+    } else {
+        g.entries = newEntries;
+    }
+    saveConfig();
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    departures.clear();
+    displaySlots.clear();
+    xSemaphoreGive(dataMutex);
+    configChanged = true;
+    server.sendHeader("Location", "/?saved=1");
     server.send(302);
 }
 
@@ -1601,6 +1899,7 @@ void handleSettings() {
     }
     cfgShowNext        = server.hasArg("show_next");
     cfgShowDisruptions = server.hasArg("show_disruptions");
+    cfgSortByTime      = server.hasArg("sort_by_time");
 
     // Apply brightness immediately
     if (cfgNightFrom >= 0 && cfgNightTo >= 0) {
@@ -1786,10 +2085,15 @@ void startConfigServer() {
     server.on("/browse", handleBrowse);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/remove", HTTP_POST, handleRemove);
+    server.on("/settings", HTTP_GET, handleSettingsPage);
     server.on("/settings", HTTP_POST, handleSettings);
     server.on("/oebb-search", handleOebbSearch);
     server.on("/oebb-save", HTTP_POST, handleOebbSave);
     server.on("/oebb-remove", HTTP_POST, handleOebbRemove);
+    server.on("/watch-group-save", HTTP_POST, handleWatchGroupSave);
+    server.on("/watch-group-remove", HTTP_POST, handleWatchGroupRemove);
+    server.on("/watch-group-edit", handleWatchGroupEdit);
+    server.on("/watch-group-update", HTTP_POST, handleWatchGroupUpdate);
     server.on("/wifi-reset", HTTP_POST, handleWifiReset);
     server.on("/factory-reset", HTTP_POST, handleFactoryReset);
     server.on("/update", handleOtaCheck);
@@ -1944,6 +2248,41 @@ void setupWiFi() {
     }
 }
 
+// ── Display slot builder (shared by WL and ÖBB fetch) ───────────────
+// deps must be sorted by countdown ascending.
+// Normal entries: 1 slot per line+direction (soonest).
+// Watch entries (watchIdx >= 0): top N per watch, sorted by countdown.
+static std::vector<Departure> buildSlots(const std::vector<Departure>& deps) {
+    std::vector<Departure> slots;
+    std::map<String, bool> seen;
+    std::map<int, std::vector<size_t>> watchIdx2pos; // watchIdx → positions in deps
+    for (size_t i = 0; i < deps.size(); i++) {
+        const auto& d = deps[i];
+        if (d.watchIdx >= 0) {
+            watchIdx2pos[d.watchIdx].push_back(i);
+        } else {
+            String key = d.lineName + "|" + d.towards;
+            if (seen.find(key) == seen.end()) {
+                slots.push_back(d);
+                seen[key] = true;
+            }
+        }
+    }
+    for (auto& kv : watchIdx2pos) {
+        int wi = kv.first;
+        if (wi >= (int)cfgWatchGroups.size()) continue;
+        int maxN = cfgWatchGroups[wi].maxDepartures;
+        for (int n = 0; n < maxN && n < (int)kv.second.size(); n++) {
+            slots.push_back(deps[kv.second[n]]);
+        }
+    }
+    if (cfgSortByTime) {
+        std::sort(slots.begin(), slots.end(),
+            [](const Departure& a, const Departure& b){ return a.countdown < b.countdown; });
+    }
+    return slots;
+}
+
 // ── API fetch ────────────────────────────────────────────────────────
 String buildUrl() {
     String url = "https://www.wienerlinien.at/ogd_realtime/monitor?activateTrafficInfo=stoerunglang";
@@ -1951,13 +2290,24 @@ String buildUrl() {
     for (auto& cl : cfgLines) {
         if (!seen[cl.rbl]) { url += "&rbl=" + cl.rbl; seen[cl.rbl] = true; }
     }
+    for (auto& g : cfgWatchGroups) {
+        for (auto& e : g.entries) {
+            if (e.source == "wl" && e.rbl.length() > 0 && !seen[e.rbl]) {
+                url += "&rbl=" + e.rbl;
+                seen[e.rbl] = true;
+            }
+        }
+    }
     return url;
 }
 
 void fetchDepartures() {
     setCrumb("fetchDepartures");
     if (WiFi.status() != WL_CONNECTED) return;
-    if (cfgLines.empty()) return;
+    bool hasWlWatch = false;
+    for (auto& g : cfgWatchGroups)
+        for (auto& e : g.entries) if (e.source == "wl") { hasWlWatch = true; break; }
+    if (cfgLines.empty() && !hasWlWatch) return;
 
     WiFiClientSecure client;
     client.setInsecure();
@@ -1992,6 +2342,18 @@ void fetchDepartures() {
     std::map<String, bool> cfgLineSet;
     for (auto& cl : cfgLines) cfgLineSet[cl.rbl + "|" + cl.name] = true;
 
+    // Build map: "rbl|lineName|towards" → groupIdx for WL watch groups
+    std::map<String, int> watchKeyMap;
+    for (size_t gi = 0; gi < cfgWatchGroups.size(); gi++) {
+        for (auto& e : cfgWatchGroups[gi].entries) {
+            if (e.source == "wl") {
+                String key = e.rbl + "|" + e.lineName + "|" + e.towards;
+                if (watchKeyMap.find(key) == watchKeyMap.end())
+                    watchKeyMap[key] = (int)gi;
+            }
+        }
+    }
+
     std::vector<Departure> newDeps;
     bool dirCacheUpdated = false;
     JsonArray monitors = doc["data"]["monitors"].as<JsonArray>();
@@ -2012,8 +2374,14 @@ void fetchDepartures() {
                 if (dirCache[rbl].size() != szBefore) dirCacheUpdated = true;
             }
 
-            // Only include departures for configured lines
-            if (!cfgLineSet[rbl + "|" + name]) continue;
+            // Check if configured line or WL watch group entry
+            bool isLine = cfgLineSet[rbl + "|" + name];
+            int gi = -1;
+            {
+                auto wit = watchKeyMap.find(rbl + "|" + name + "|" + towards);
+                if (wit != watchKeyMap.end()) gi = wit->second;
+            }
+            if (!isLine && gi < 0) continue;
 
             JsonArray deps = line["departures"]["departure"].as<JsonArray>();
             for (JsonObject dep : deps) {
@@ -2023,6 +2391,7 @@ void fetchDepartures() {
                 d.type      = type;
                 d.countdown = dep["departureTime"]["countdown"] | -1;
                 d.realtime  = rt;
+                d.watchIdx  = isLine ? -1 : gi;
                 if (d.countdown >= 0) newDeps.push_back(d);
             }
         }
@@ -2032,16 +2401,8 @@ void fetchDepartures() {
     std::sort(newDeps.begin(), newDeps.end(),
         [](const Departure& a, const Departure& b) { return a.countdown < b.countdown; });
 
-    // ── Smart grouping: one slot per line+direction (soonest departure) ──
-    std::vector<Departure> newSlots;
-    std::map<String, bool> seen;
-    for (auto& d : newDeps) {
-        String key = d.lineName + "|" + d.towards;
-        if (seen.find(key) == seen.end()) {
-            newSlots.push_back(d);
-            seen[key] = true;
-        }
-    }
+    // ── Smart grouping: 1 slot per line+direction + watch top-N ──
+    auto newSlots = buildSlots(newDeps);
 
     // Parse disruptions
     std::vector<String> newDisruptions;
@@ -2147,7 +2508,10 @@ std::vector<Departure> fetchOebbStation(const String& stationName, int nowMin) {
 void fetchOebbDepartures() {
     setCrumb("fetchOebbDepartures");
     if (WiFi.status() != WL_CONNECTED) return;
-    if (cfgOebb.empty()) return;
+    bool hasOebbWatch = false;
+    for (auto& g : cfgWatchGroups)
+        for (auto& e : g.entries) if (e.source == "oebb") { hasOebbWatch = true; break; }
+    if (cfgOebb.empty() && !hasOebbWatch) return;
 
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo, 5000)) {
@@ -2175,21 +2539,30 @@ void fetchOebbDepartures() {
         }
     }
 
+    // Add ÖBB watch group departures (selected lines, tagged with group index)
+    for (size_t gi = 0; gi < cfgWatchGroups.size(); gi++) {
+        for (auto& e : cfgWatchGroups[gi].entries) {
+            if (e.source != "oebb") continue;
+            if (stationCache.find(e.oebbStation) == stationCache.end())
+                stationCache[e.oebbStation] = fetchOebbStation(e.oebbStation, nowMin);
+            for (auto& d : stationCache[e.oebbStation]) {
+                if (d.lineName == e.lineName && d.towards == e.towards) {
+                    Departure wd = d;
+                    wd.watchIdx = (int)gi;
+                    oebbDeps.push_back(wd);
+                    break; // take only soonest matching departure per entry
+                }
+            }
+        }
+    }
+
     if (oebbDeps.empty()) return;
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     for (auto& d : oebbDeps) departures.push_back(d);
     std::sort(departures.begin(), departures.end(),
         [](const Departure& a, const Departure& b) { return a.countdown < b.countdown; });
-    displaySlots.clear();
-    std::map<String, bool> seen;
-    for (auto& d : departures) {
-        String key = d.lineName + "|" + d.towards;
-        if (seen.find(key) == seen.end()) {
-            displaySlots.push_back(d);
-            seen[key] = true;
-        }
-    }
+    displaySlots = buildSlots(departures);
     xSemaphoreGive(dataMutex);
 }
 
