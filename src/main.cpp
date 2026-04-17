@@ -98,7 +98,7 @@ void saveCrashInfo() {
 }
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.2.1"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -3154,7 +3154,7 @@ void setup() {
 
     tft.init();
     delay(150);  // give ST7789 time to wake up before first draw
-    tft.setRotation(1);
+    tft.setRotation(3);
 
     // Fahrgastinformationssystem colors
     BG_COLOR  = tft.color565(10, 8, 5);
