@@ -98,7 +98,7 @@ void saveCrashInfo() {
 }
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.4.0"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -182,11 +182,11 @@ struct PongPlayer {
 
 struct PongState {
     PongPlayer    left, right;
-    int           leftPaddleY  = 67;
-    int           rightPaddleY = 67;
-    int           ballX        = 160;
-    int           ballY        = 85;
-    int           ballVX       = 2;
+    int           leftPaddleY  = 64;
+    int           rightPaddleY = 64;
+    int           ballX        = 156;
+    int           ballY        = 81;
+    int           ballVX       = 4;
     int           ballVY       = 1;
     int           leftScore    = 0;
     int           rightScore   = 0;
@@ -194,18 +194,32 @@ struct PongState {
     bool          gameOver     = false;
     int           winner       = 0;        // 0 = none, 1 = left, 2 = right
     unsigned long gameOverMs   = 0;
+    // Visual feedback
+    int           trailX[4]    = {0,0,0,0};
+    int           trailY[4]    = {0,0,0,0};
+    uint8_t       trailIdx     = 0;
+    unsigned long leftHitMs    = 0;
+    unsigned long rightHitMs   = 0;
+    unsigned long lastGoalMs   = 0;        // 0 = no recent goal
+    int           lastGoalSide = 0;         // 1=left scored, 2=right scored
+    unsigned long serveAtMs    = 0;        // ball is frozen until this time
+    int           rallyHits    = 0;        // for speed scaling
 };
 static PongState pong;
 static SemaphoreHandle_t pongMutex = nullptr;
 
-static const int  PONG_PADDLE_W       = 6;
-static const int  PONG_PADDLE_H       = 36;
-static const int  PONG_BALL_SIZE      = 5;
-static const int  PONG_PADDLE_SPEED   = 3;
+static const int  PONG_PADDLE_W       = 12;
+static const int  PONG_PADDLE_H       = 42;
+static const int  PONG_BALL_SIZE      = 9;
+static const int  PONG_PADDLE_SPEED   = 5;
+static const int  PONG_BALL_SPEED_START = 4;
+static const int  PONG_BALL_SPEED_MAX   = 7;
 static const int  PONG_SCORE_TO_WIN   = 5;
 static const unsigned long PONG_PLAYER_TIMEOUT_MS  = 15000;
 static const unsigned long PONG_ABANDON_TIMEOUT_MS = 30000;
-static const unsigned long PONG_GAMEOVER_HOLD_MS   = 5000;
+static const unsigned long PONG_GAMEOVER_HOLD_MS   = 6500;
+static const unsigned long PONG_GOAL_ANIM_MS      = 1500;   // total freeze after goal
+static const unsigned long PONG_HIT_FLASH_MS       = 120;
 
 // Score (0..5) → Stationsname (U4-Style Endstation-Progression)
 static const char* PONG_STATIONS[] = {
@@ -2194,6 +2208,7 @@ static const char PONG_PAGE[] PROGMEM = R"rawliteral(<!doctype html>
   }
 
   function setDir(d){
+    if(d !== 0 && d !== curDir) navigator.vibrate && navigator.vibrate(18);
     curDir = d;
     document.getElementById('up').classList.toggle('held', d === -1);
     document.getElementById('down').classList.toggle('held', d === 1);
@@ -2227,20 +2242,35 @@ static const char PONG_PAGE[] PROGMEM = R"rawliteral(<!doctype html>
     postForm('/pong/move', {token, dir: 0}).catch(()=>{});
   }, 4000);
 
-  // Poll state for live score
+  // Poll state for live score + vibration feedback
+  let prevL = 0, prevR = 0, prevOver = false;
   async function pollState(){
     try{
       const r = await fetch('/pong/state');
       const d = await r.json();
       document.getElementById('score').textContent = d.l + ' : ' + d.r;
+
+      // Goal vibration: detect score increase
+      if(side !== 'spectator'){
+        const myScore = side === 'left' ? d.l : d.r;
+        const myPrev  = side === 'left' ? prevL : prevR;
+        const oppScore = side === 'left' ? d.r : d.l;
+        const oppPrev  = side === 'left' ? prevR : prevL;
+        if(myScore > myPrev)  navigator.vibrate && navigator.vibrate([40, 30, 40]);  // scored!
+        if(oppScore > oppPrev) navigator.vibrate && navigator.vibrate(80);            // conceded
+      }
+      prevL = d.l; prevR = d.r;
+
       const banner = document.getElementById('banner');
       if(d.over){
+        if(!prevOver) navigator.vibrate && navigator.vibrate([100, 80, 100, 80, 200]);
         document.getElementById('bTitle').textContent = 'Endstation!';
         document.getElementById('bSub').textContent = (d.win===1?'LINKS':'RECHTS') + ' gewinnt';
         banner.classList.add('show');
       } else {
         banner.classList.remove('show');
       }
+      prevOver = d.over;
     }catch(e){}
   }
   setInterval(pollState, 500);
@@ -2942,8 +2972,10 @@ void drawGlowText(TFT_eSprite& spr, int x, int y, const String& text) {
 static void resetPongBall(int direction) {
     pong.ballX  = SCREEN_W / 2 - PONG_BALL_SIZE / 2;
     pong.ballY  = SCREEN_H / 2 - PONG_BALL_SIZE / 2;
-    pong.ballVX = direction >= 0 ? 2 : -2;
+    pong.ballVX = direction >= 0 ? PONG_BALL_SPEED_START : -PONG_BALL_SPEED_START;
     pong.ballVY = (esp_random() & 1) ? 1 : -1;
+    pong.rallyHits = 0;
+    for (int i = 0; i < 4; i++) { pong.trailX[i] = pong.ballX; pong.trailY[i] = pong.ballY; }
 }
 
 static void resetPongMatch() {
@@ -2952,9 +2984,12 @@ static void resetPongMatch() {
     pong.gameOver   = false;
     pong.winner     = 0;
     pong.gameOverMs = 0;
+    pong.lastGoalMs = 0;
+    pong.lastGoalSide = 0;
     pong.leftPaddleY  = (SCREEN_H - PONG_PADDLE_H) / 2;
     pong.rightPaddleY = (SCREEN_H - PONG_PADDLE_H) / 2;
     resetPongBall((esp_random() & 1) ? 1 : -1);
+    pong.serveAtMs = millis() + 1500;  // initial 1.5s countdown before first serve
 }
 
 void pongTick() {
@@ -3007,7 +3042,7 @@ void pongTick() {
     }
 
     if (pong.gameRunning && !pong.gameOver) {
-        // Paddel-Update
+        // Paddel-Update — works even during serve freeze so players can position
         pong.leftPaddleY  += pong.left.inputDir  * PONG_PADDLE_SPEED;
         pong.rightPaddleY += pong.right.inputDir * PONG_PADDLE_SPEED;
         if (pong.leftPaddleY  < 0) pong.leftPaddleY  = 0;
@@ -3015,63 +3050,85 @@ void pongTick() {
         if (pong.leftPaddleY  > SCREEN_H - PONG_PADDLE_H) pong.leftPaddleY  = SCREEN_H - PONG_PADDLE_H;
         if (pong.rightPaddleY > SCREEN_H - PONG_PADDLE_H) pong.rightPaddleY = SCREEN_H - PONG_PADDLE_H;
 
-        // Ball-Update
-        pong.ballX += pong.ballVX;
-        pong.ballY += pong.ballVY;
+        // Serve freeze: ball stays still while goal animation / countdown plays
+        bool ballFrozen = (pong.serveAtMs > now);
 
-        // Wall bounce (top/bottom)
-        if (pong.ballY <= 0) { pong.ballY = 0; pong.ballVY = -pong.ballVY; }
-        if (pong.ballY >= SCREEN_H - PONG_BALL_SIZE) {
-            pong.ballY = SCREEN_H - PONG_BALL_SIZE;
-            pong.ballVY = -pong.ballVY;
-        }
+        if (!ballFrozen) {
+            // Trail (record before move so trail trails the new position)
+            pong.trailX[pong.trailIdx] = pong.ballX;
+            pong.trailY[pong.trailIdx] = pong.ballY;
+            pong.trailIdx = (pong.trailIdx + 1) & 0x3;
 
-        // Paddle collision
-        const int leftPaddleX  = PX_MARGIN;
-        const int rightPaddleX = SCREEN_W - PX_MARGIN - PONG_PADDLE_W;
+            // Ball-Update
+            pong.ballX += pong.ballVX;
+            pong.ballY += pong.ballVY;
 
-        if (pong.ballVX < 0 &&
-            pong.ballX <= leftPaddleX + PONG_PADDLE_W &&
-            pong.ballX + PONG_BALL_SIZE >= leftPaddleX &&
-            pong.ballY + PONG_BALL_SIZE >= pong.leftPaddleY &&
-            pong.ballY <= pong.leftPaddleY + PONG_PADDLE_H) {
-            pong.ballX = leftPaddleX + PONG_PADDLE_W;
-            pong.ballVX = -pong.ballVX;
-            int hitOffset = (pong.ballY + PONG_BALL_SIZE / 2) - (pong.leftPaddleY + PONG_PADDLE_H / 2);
-            pong.ballVY += hitOffset / 8;
-            if (pong.ballVY > 3)  pong.ballVY = 3;
-            if (pong.ballVY < -3) pong.ballVY = -3;
-        }
-
-        if (pong.ballVX > 0 &&
-            pong.ballX + PONG_BALL_SIZE >= rightPaddleX &&
-            pong.ballX <= rightPaddleX + PONG_PADDLE_W &&
-            pong.ballY + PONG_BALL_SIZE >= pong.rightPaddleY &&
-            pong.ballY <= pong.rightPaddleY + PONG_PADDLE_H) {
-            pong.ballX = rightPaddleX - PONG_BALL_SIZE;
-            pong.ballVX = -pong.ballVX;
-            int hitOffset = (pong.ballY + PONG_BALL_SIZE / 2) - (pong.rightPaddleY + PONG_PADDLE_H / 2);
-            pong.ballVY += hitOffset / 8;
-            if (pong.ballVY > 3)  pong.ballVY = 3;
-            if (pong.ballVY < -3) pong.ballVY = -3;
-        }
-
-        // Goal
-        if (pong.ballX + PONG_BALL_SIZE < 0) {
-            pong.rightScore++;
-            if (pong.rightScore >= PONG_SCORE_TO_WIN) {
-                pong.gameOver = true; pong.winner = 2; pong.gameOverMs = now;
-                pong.gameRunning = false;
-            } else {
-                resetPongBall(-1);  // ball heads to the player who just lost (left)
+            // Wall bounce (top/bottom)
+            if (pong.ballY <= 0) { pong.ballY = 0; pong.ballVY = -pong.ballVY; }
+            if (pong.ballY >= SCREEN_H - PONG_BALL_SIZE) {
+                pong.ballY = SCREEN_H - PONG_BALL_SIZE;
+                pong.ballVY = -pong.ballVY;
             }
-        } else if (pong.ballX > SCREEN_W) {
-            pong.leftScore++;
-            if (pong.leftScore >= PONG_SCORE_TO_WIN) {
-                pong.gameOver = true; pong.winner = 1; pong.gameOverMs = now;
-                pong.gameRunning = false;
-            } else {
-                resetPongBall(1);   // ball heads to the player who just lost (right)
+
+            // Paddle collision
+            const int leftPaddleX  = PX_MARGIN;
+            const int rightPaddleX = SCREEN_W - PX_MARGIN - PONG_PADDLE_W;
+
+            if (pong.ballVX < 0 &&
+                pong.ballX <= leftPaddleX + PONG_PADDLE_W &&
+                pong.ballX + PONG_BALL_SIZE >= leftPaddleX &&
+                pong.ballY + PONG_BALL_SIZE >= pong.leftPaddleY &&
+                pong.ballY <= pong.leftPaddleY + PONG_PADDLE_H) {
+                pong.ballX = leftPaddleX + PONG_PADDLE_W;
+                pong.ballVX = -pong.ballVX;
+                if (pong.ballVX < PONG_BALL_SPEED_MAX) pong.ballVX += 1;   // accelerate
+                int hitOffset = (pong.ballY + PONG_BALL_SIZE / 2) - (pong.leftPaddleY + PONG_PADDLE_H / 2);
+                pong.ballVY += hitOffset / 8;
+                if (pong.ballVY > 4)  pong.ballVY = 4;
+                if (pong.ballVY < -4) pong.ballVY = -4;
+                pong.leftHitMs = now;
+                pong.rallyHits++;
+            }
+
+            if (pong.ballVX > 0 &&
+                pong.ballX + PONG_BALL_SIZE >= rightPaddleX &&
+                pong.ballX <= rightPaddleX + PONG_PADDLE_W &&
+                pong.ballY + PONG_BALL_SIZE >= pong.rightPaddleY &&
+                pong.ballY <= pong.rightPaddleY + PONG_PADDLE_H) {
+                pong.ballX = rightPaddleX - PONG_BALL_SIZE;
+                pong.ballVX = -pong.ballVX;
+                if (pong.ballVX > -PONG_BALL_SPEED_MAX) pong.ballVX -= 1;  // accelerate (negative)
+                int hitOffset = (pong.ballY + PONG_BALL_SIZE / 2) - (pong.rightPaddleY + PONG_PADDLE_H / 2);
+                pong.ballVY += hitOffset / 8;
+                if (pong.ballVY > 4)  pong.ballVY = 4;
+                if (pong.ballVY < -4) pong.ballVY = -4;
+                pong.rightHitMs = now;
+                pong.rallyHits++;
+            }
+
+            // Goal
+            if (pong.ballX + PONG_BALL_SIZE < 0) {
+                pong.rightScore++;
+                pong.lastGoalMs = now;
+                pong.lastGoalSide = 2;
+                if (pong.rightScore >= PONG_SCORE_TO_WIN) {
+                    pong.gameOver = true; pong.winner = 2; pong.gameOverMs = now;
+                    pong.gameRunning = false;
+                } else {
+                    resetPongBall(-1);
+                    pong.serveAtMs = now + PONG_GOAL_ANIM_MS;
+                }
+            } else if (pong.ballX > SCREEN_W) {
+                pong.leftScore++;
+                pong.lastGoalMs = now;
+                pong.lastGoalSide = 1;
+                if (pong.leftScore >= PONG_SCORE_TO_WIN) {
+                    pong.gameOver = true; pong.winner = 1; pong.gameOverMs = now;
+                    pong.gameRunning = false;
+                } else {
+                    resetPongBall(1);
+                    pong.serveAtMs = now + PONG_GOAL_ANIM_MS;
+                }
             }
         }
     }
@@ -3079,12 +3136,61 @@ void pongTick() {
     xSemaphoreGive(pongMutex);
 }
 
+// ── Pong: render helpers ────────────────────────────────────────────
+// Draws a paddle styled as a Wiener-U-Bahn-Waggon (12x42 px).
+//   facingRight = true → "front" / headlight on right side (left paddle)
+//   facingRight = false → headlight on left side (right paddle)
+//   bright = true → recently hit, draw with glow halo
+static void drawUBahnWaggon(int x, int y, bool facingRight, bool dim, bool bright) {
+    uint16_t main   = dim ? AMBER_DIM : AMBER;
+    uint16_t accent = dim ? AMBER_DIM : AMBER;
+
+    // Bright glow halo when recently hit
+    if (bright) {
+        sprite.drawRect(x - 1, y - 1, PONG_PADDLE_W + 2, PONG_PADDLE_H + 2, AMBER);
+        sprite.drawRect(x - 2, y - 2, PONG_PADDLE_W + 4, PONG_PADDLE_H + 4, AMBER_DIM);
+    }
+
+    // Body outline (rounded corners simulated by skipping corner pixels)
+    sprite.fillRect(x, y, PONG_PADDLE_W, PONG_PADDLE_H, BG_COLOR);
+    sprite.drawRect(x,     y,     PONG_PADDLE_W,     PONG_PADDLE_H,     main);
+    sprite.drawRect(x + 1, y + 1, PONG_PADDLE_W - 2, PONG_PADDLE_H - 2, main);
+    // Corner trims
+    sprite.drawPixel(x,                   y,                   BG_COLOR);
+    sprite.drawPixel(x + PONG_PADDLE_W-1, y,                   BG_COLOR);
+    sprite.drawPixel(x,                   y + PONG_PADDLE_H-1, BG_COLOR);
+    sprite.drawPixel(x + PONG_PADDLE_W-1, y + PONG_PADDLE_H-1, BG_COLOR);
+
+    // 4 windows down the side, each 6 wide x 5 tall
+    int winX = x + 3;
+    int winYStart = y + 5;
+    for (int i = 0; i < 4; i++) {
+        int wy = winYStart + i * 9;
+        if (wy + 5 > y + PONG_PADDLE_H - 5) break;
+        sprite.fillRect(winX, wy, 6, 5, accent);
+    }
+
+    // Headlight strip on the front side
+    int headX = facingRight ? (x + PONG_PADDLE_W - 2) : x;
+    sprite.fillRect(headX, y + PONG_PADDLE_H / 2 - 6, 2, 12, AMBER);
+}
+
+// Draw the ball as a "Fahrgast" — body + head, recognizable as a person.
+static void drawFahrgast(int cx, int cy, uint16_t col) {
+    // Body (6x5 oval)
+    sprite.fillRect(cx - 3, cy - 1, 6, 5, col);
+    sprite.drawPixel(cx - 3, cy - 1, BG_COLOR);
+    sprite.drawPixel(cx + 2, cy - 1, BG_COLOR);
+    sprite.drawPixel(cx - 3, cy + 3, BG_COLOR);
+    sprite.drawPixel(cx + 2, cy + 3, BG_COLOR);
+    // Shoulders (slightly wider top of body)
+    sprite.drawFastHLine(cx - 3, cy, 6, col);
+    // Head (small block above)
+    sprite.fillRect(cx - 1, cy - 4, 3, 3, col);
+}
+
 // ── Pong: render scene ───────────────────────────────────────────────
-// Caller must have created the sprite already; we draw on top and let
-// drawDisplay finish with pushSprite/deleteSprite.
 void drawPongScene() {
-    // Snapshot state under mutex so the draw is consistent even if a web
-    // handler updates inputs mid-frame.
     PongState s;
     bool bothActive = false;
     if (pongMutex && xSemaphoreTake(pongMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
@@ -3095,75 +3201,175 @@ void drawPongScene() {
         s = pong;
     }
 
-    sprite.fillSprite(BG_COLOR);
+    unsigned long now = millis();
+    bool inGoalAnim = s.lastGoalMs > 0 && now - s.lastGoalMs < PONG_GOAL_ANIM_MS;
+    unsigned long sinceGoal = inGoalAnim ? (now - s.lastGoalMs) : 0;
 
-    // U-Bahn track lines (top + bottom dashed rails)
-    for (int x = 0; x < SCREEN_W; x += 6) {
-        sprite.drawFastHLine(x,     2,             3, AMBER_DIM);
-        sprite.drawFastHLine(x,     SCREEN_H - 3,  3, AMBER_DIM);
+    // Goal flash: full-screen amber pulse (twice, ~70ms each, in first 200ms)
+    bool goalFlash = inGoalAnim && (sinceGoal < 70 || (sinceGoal > 90 && sinceGoal < 160));
+    sprite.fillSprite(goalFlash ? AMBER_DIM : BG_COLOR);
+
+    // U-Bahn track rails (chunky dashed top/bottom)
+    for (int x = 0; x < SCREEN_W; x += 8) {
+        sprite.fillRect(x,     2,             5, 2, AMBER_DIM);
+        sprite.fillRect(x,     SCREEN_H - 4,  5, 2, AMBER_DIM);
     }
 
     // Center dashed line
-    for (int y = 18; y < SCREEN_H - 6; y += 8) {
-        sprite.drawFastVLine(SCREEN_W / 2, y, 4, AMBER_DIM);
+    for (int y = 22; y < SCREEN_H - 8; y += 10) {
+        sprite.fillRect(SCREEN_W / 2 - 1, y, 2, 5, AMBER_DIM);
     }
 
-    // Score (Stationsname progression) — top bar
+    // Score header — Stationsname + number
     sprite.setTextFont(1);
     sprite.setTextSize(1);
-    sprite.setTextColor(AMBER, BG_COLOR);
-    int leftIdx  = s.leftScore  < (int)(sizeof(PONG_STATIONS)/sizeof(PONG_STATIONS[0])) ? s.leftScore  : 5;
-    int rightIdx = s.rightScore < (int)(sizeof(PONG_STATIONS)/sizeof(PONG_STATIONS[0])) ? s.rightScore : 5;
-    String leftName  = String(PONG_STATIONS[leftIdx])  + " " + String(s.leftScore);
-    String rightName = String(s.rightScore) + " " + String(PONG_STATIONS[rightIdx]);
-    sprite.setCursor(6, 8);
-    sprite.print(leftName);
+    int stationCount = (int)(sizeof(PONG_STATIONS) / sizeof(PONG_STATIONS[0]));
+    int leftIdx  = s.leftScore  < stationCount ? s.leftScore  : stationCount - 1;
+    int rightIdx = s.rightScore < stationCount ? s.rightScore : stationCount - 1;
+
+    bool pulseLeft  = inGoalAnim && s.lastGoalSide == 1 && (sinceGoal / 100) % 2 == 0;
+    bool pulseRight = inGoalAnim && s.lastGoalSide == 2 && (sinceGoal / 100) % 2 == 0;
+
+    String leftName  = String(s.leftScore)  + ":" + String(PONG_STATIONS[leftIdx]);
+    String rightName = String(PONG_STATIONS[rightIdx]) + ":" + String(s.rightScore);
+    sprite.setTextColor(pulseLeft ? AMBER_DIM : AMBER, BG_COLOR);
+    sprite.setCursor(8, 8); sprite.print(leftName);
     int rw = sprite.textWidth(rightName);
-    sprite.setCursor(SCREEN_W - rw - 6, 8);
-    sprite.print(rightName);
+    sprite.setTextColor(pulseRight ? AMBER_DIM : AMBER, BG_COLOR);
+    sprite.setCursor(SCREEN_W - rw - 8, 8); sprite.print(rightName);
 
-    // Helper lambda: draw a paddle styled as a U-Bahn-Waggon
-    auto drawWaggon = [](int x, int y, bool dim) {
-        uint16_t col = dim ? AMBER_DIM : AMBER;
-        sprite.drawRect(x, y, PONG_PADDLE_W, PONG_PADDLE_H, col);
-        // Tiny windows along the side (3 dots)
-        for (int wy = 6; wy < PONG_PADDLE_H - 4; wy += 12) {
-            sprite.fillRect(x + 2, y + wy, 2, 2, col);
+    // Win sequence (≥ 6.5s hold): U-Bahn slides into Heiligenstadt
+    if (s.gameOver) {
+        sprite.setTextColor(AMBER, BG_COLOR);
+
+        unsigned long elapsed = now - s.gameOverMs;
+
+        // Phase 1: train slides in from the loser's side toward winner's side
+        // (winner=1: train enters from right, slides left → "arrives" at left=Heiligenstadt sign)
+        // (winner=2: train enters from left, slides right)
+        const int trainW = 110;
+        const int trainH = 48;
+        int trainY = SCREEN_H / 2 - trainH / 2;
+        int slideMs = 1800;
+        int progress = elapsed > (unsigned long)slideMs ? slideMs : (int)elapsed;
+        int trainX;
+        if (s.winner == 1) {
+            // start off-screen right, end at left margin
+            int startX = SCREEN_W;
+            int endX   = 12;
+            trainX = startX + (endX - startX) * progress / slideMs;
+        } else {
+            int startX = -trainW;
+            int endX   = SCREEN_W - trainW - 12;
+            trainX = startX + (endX - startX) * progress / slideMs;
         }
-        // Headlight at the top
-        sprite.drawFastHLine(x + 1, y, PONG_PADDLE_W - 2, col);
-    };
 
-    drawWaggon(PX_MARGIN,                         s.leftPaddleY,  !s.left.active);
-    drawWaggon(SCREEN_W - PX_MARGIN - PONG_PADDLE_W, s.rightPaddleY, !s.right.active);
+        // Draw a 3-waggon train
+        for (int i = 0; i < 3; i++) {
+            int wx = trainX + i * 38;
+            // body
+            sprite.fillRect(wx, trainY, 34, trainH, BG_COLOR);
+            sprite.drawRect(wx, trainY, 34, trainH, AMBER);
+            sprite.drawRect(wx + 1, trainY + 1, 32, trainH - 2, AMBER);
+            // windows
+            for (int j = 0; j < 3; j++) {
+                sprite.fillRect(wx + 4 + j * 9, trainY + 6, 7, 12, AMBER);
+            }
+            // bottom wheels
+            sprite.fillRect(wx + 4,  trainY + trainH - 4, 6, 3, AMBER_DIM);
+            sprite.fillRect(wx + 24, trainY + trainH - 4, 6, 3, AMBER_DIM);
+            // doors
+            sprite.fillRect(wx + 4, trainY + 22, 26, 18, BG_COLOR);
+            sprite.drawRect(wx + 4, trainY + 22, 26, 18, AMBER);
+            sprite.drawFastVLine(wx + 17, trainY + 22, 18, AMBER);
+        }
+        // Headlight on the leading waggon
+        if (s.winner == 1) {
+            sprite.fillRect(trainX - 2, trainY + trainH/2 - 4, 3, 8, AMBER);
+        } else {
+            sprite.fillRect(trainX + 3 * 38 + 32, trainY + trainH/2 - 4, 3, 8, AMBER);
+        }
 
-    // Ball = Fahrgast (with tiny glow halo)
-    sprite.fillRect(s.ballX - 1, s.ballY - 1, PONG_BALL_SIZE + 2, PONG_BALL_SIZE + 2, AMBER_DIM);
-    sprite.fillRect(s.ballX,     s.ballY,     PONG_BALL_SIZE,     PONG_BALL_SIZE,     AMBER);
+        // Phase 2: Endstation banner overlay (after slide finishes)
+        if (elapsed > 1800) {
+            sprite.setTextSize(2);
+            const char* line1 = "ENDSTATION";
+            int tw1 = sprite.textWidth(line1);
+            drawGlowText(sprite, (SCREEN_W - tw1) / 2, 18, line1);
+
+            sprite.setTextSize(2);
+            const char* line2 = "HEILIGENSTADT";
+            int tw2 = sprite.textWidth(line2);
+            drawGlowText(sprite, (SCREEN_W - tw2) / 2, 38, line2);
+
+            sprite.setTextSize(1);
+            String line3 = String(s.winner == 1 ? "LINKS" : "RECHTS") + " gewinnt!";
+            int tw3 = sprite.textWidth(line3);
+            drawGlowText(sprite, (SCREEN_W - tw3) / 2, SCREEN_H - 22, line3);
+        }
+        return;
+    }
+
+    // Trail (3 most recent past positions, fading)
+    if (bothActive && s.gameRunning && !inGoalAnim) {
+        for (int i = 1; i <= 3; i++) {
+            uint8_t idx = (uint8_t)((s.trailIdx - i) & 0x3);
+            int tx = s.trailX[idx] + PONG_BALL_SIZE / 2;
+            int ty = s.trailY[idx] + PONG_BALL_SIZE / 2;
+            int r  = 4 - i;
+            if (r > 0) sprite.fillRect(tx - r, ty - r, r * 2, r * 2, AMBER_DIM);
+        }
+    }
+
+    // Paddles (U-Bahn-Waggons)
+    bool leftBright  = (now - s.leftHitMs)  < PONG_HIT_FLASH_MS;
+    bool rightBright = (now - s.rightHitMs) < PONG_HIT_FLASH_MS;
+    drawUBahnWaggon(PX_MARGIN, s.leftPaddleY, true,  !s.left.active,  leftBright);
+    drawUBahnWaggon(SCREEN_W - PX_MARGIN - PONG_PADDLE_W, s.rightPaddleY, false, !s.right.active, rightBright);
+
+    // Ball = Fahrgast — only show if not in goal-flash window (so flash reads as goal)
+    bool ballHidden = inGoalAnim && sinceGoal < 200;
+    if (!ballHidden) {
+        int bcx = s.ballX + PONG_BALL_SIZE / 2;
+        int bcy = s.ballY + PONG_BALL_SIZE / 2;
+        // Glow halo
+        sprite.fillRect(bcx - 5, bcy - 6, 10, 12, AMBER_DIM);
+        drawFahrgast(bcx, bcy, AMBER);
+    }
 
     // Overlays
     sprite.setTextFont(1);
-    if (!bothActive && !s.gameOver) {
+
+    if (!bothActive) {
         sprite.setTextSize(2);
         const char* msg = "Warte auf Mitspieler...";
         int tw = sprite.textWidth(msg);
-        drawGlowText(sprite, (SCREEN_W - tw) / 2, SCREEN_H / 2 - 14, msg);
+        drawGlowText(sprite, (SCREEN_W - tw) / 2, SCREEN_H / 2 - 12, msg);
         sprite.setTextSize(1);
         const char* hint = "linetracker.local/pong";
         int hw = sprite.textWidth(hint);
         sprite.setTextColor(AMBER_DIM, BG_COLOR);
-        sprite.setCursor((SCREEN_W - hw) / 2, SCREEN_H / 2 + 8);
+        sprite.setCursor((SCREEN_W - hw) / 2, SCREEN_H / 2 + 12);
         sprite.print(hint);
-    } else if (s.gameOver) {
-        sprite.setTextSize(2);
-        const char* line1 = "Endstation!";
-        int tw1 = sprite.textWidth(line1);
-        drawGlowText(sprite, (SCREEN_W - tw1) / 2, SCREEN_H / 2 - 22, line1);
-        String line2 = String(s.winner == 1 ? "Links" : "Rechts") + " gewinnt: " +
-                        String(PONG_STATIONS[5]);
-        sprite.setTextSize(1);
-        int tw2 = sprite.textWidth(line2);
-        drawGlowText(sprite, (SCREEN_W - tw2) / 2, SCREEN_H / 2 + 4, line2);
+        return;
+    }
+
+    // Goal animation: big EINFAHRT! text, then 3-2-1 countdown before serve
+    if (inGoalAnim) {
+        sprite.setTextSize(3);
+        const char* msg = "EINFAHRT!";
+        int tw = sprite.textWidth(msg);
+        // grow effect: shift up slightly during first 400ms
+        int yOff = sinceGoal < 400 ? (int)(sinceGoal / 100) : 4;
+        drawGlowText(sprite, (SCREEN_W - tw) / 2, SCREEN_H / 2 - 12 - (4 - yOff), msg);
+    } else if (s.serveAtMs > now) {
+        unsigned long remain = s.serveAtMs - now;
+        int n = (int)((remain + 333) / 333);
+        if (n < 1) n = 1; if (n > 3) n = 3;
+        sprite.setTextSize(5);
+        String num = String(n);
+        int tw = sprite.textWidth(num);
+        drawGlowText(sprite, (SCREEN_W - tw) / 2, SCREEN_H / 2 - 18, num);
     }
 }
 
