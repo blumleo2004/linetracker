@@ -98,7 +98,7 @@ void saveCrashInfo() {
 }
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.2.1"
+#define FW_VERSION "1.3.0"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -167,6 +167,51 @@ static DNSServer     apDns;
 static unsigned long wifiDownSince  = 0;
 static volatile bool portalOpen     = false;
 static volatile bool portalShouldOpen = false;
+
+// ── Pong (2-Player Easter Egg) ───────────────────────────────────────
+enum AppMode { MODE_DEPARTURES = 0, MODE_PONG = 1 };
+static volatile AppMode appMode = MODE_DEPARTURES;
+
+struct PongPlayer {
+    bool          active       = false;
+    char          token[9]     = {0};      // 8-char hex session token
+    int8_t        inputDir     = 0;         // -1 up, 0 idle, +1 down
+    unsigned long lastInputMs  = 0;
+    unsigned long lastSeenMs   = 0;
+};
+
+struct PongState {
+    PongPlayer    left, right;
+    int           leftPaddleY  = 67;
+    int           rightPaddleY = 67;
+    int           ballX        = 160;
+    int           ballY        = 85;
+    int           ballVX       = 2;
+    int           ballVY       = 1;
+    int           leftScore    = 0;
+    int           rightScore   = 0;
+    bool          gameRunning  = false;
+    bool          gameOver     = false;
+    int           winner       = 0;        // 0 = none, 1 = left, 2 = right
+    unsigned long gameOverMs   = 0;
+};
+static PongState pong;
+static SemaphoreHandle_t pongMutex = nullptr;
+
+static const int  PONG_PADDLE_W       = 6;
+static const int  PONG_PADDLE_H       = 36;
+static const int  PONG_BALL_SIZE      = 5;
+static const int  PONG_PADDLE_SPEED   = 3;
+static const int  PONG_SCORE_TO_WIN   = 5;
+static const unsigned long PONG_PLAYER_TIMEOUT_MS  = 15000;
+static const unsigned long PONG_ABANDON_TIMEOUT_MS = 30000;
+static const unsigned long PONG_GAMEOVER_HOLD_MS   = 5000;
+
+// Score (0..5) → Stationsname (U4-Style Endstation-Progression)
+static const char* PONG_STATIONS[] = {
+    "Karlsplatz", "Stephansplatz", "Schwedenplatz",
+    "Praterstern", "Schottenring", "Heiligenstadt"
+};
 
 void loadDirCache() {
     if (!SPIFFS.exists(DIR_CACHE_PATH)) return;
@@ -719,7 +764,9 @@ std::vector<std::pair<String,String>> searchStations(const String& query) {
             String name = String(haltRecords[i].name);
             String lowerName = name; lowerName.toLowerCase();
             String normName = normalizeForSearch(name);
-            if (lowerName.indexOf(lowerQuery) >= 0 || normName.indexOf(normQuery) >= 0) {
+            String normNameNS = normName; normNameNS.replace(" ", "");
+            String normQueryNS = normQuery; normQueryNS.replace(" ", "");
+            if (lowerName.indexOf(lowerQuery) >= 0 || normName.indexOf(normQuery) >= 0 || normNameNS.indexOf(normQueryNS) >= 0) {
                 results.push_back({String(haltRecords[i].haltId), name});
                 if (results.size() >= 15) break;
             }
@@ -746,12 +793,14 @@ std::vector<std::pair<String,String>> searchStations(const String& query) {
         name.replace("\"", "");
         if (name.length() == 0) continue;
 
-        // Match against both lowercase UTF-8 and normalized ASCII
+        // Match against both lowercase UTF-8 and normalized ASCII (incl. space-stripped)
         String lowerName = name;
         lowerName.toLowerCase();
         String normName = normalizeForSearch(name);
+        String normNameNS = normName; normNameNS.replace(" ", "");
+        String normQueryNS = normQuery; normQueryNS.replace(" ", "");
 
-        if (lowerName.indexOf(lowerQuery) >= 0 || normName.indexOf(normQuery) >= 0) {
+        if (lowerName.indexOf(lowerQuery) >= 0 || normName.indexOf(normQuery) >= 0 || normNameNS.indexOf(normQueryNS) >= 0) {
             String haltId = line.substring(0, s1);
             haltId.replace("\"", "");
             if (haltId.length() > 0) {
@@ -1202,7 +1251,8 @@ void handleRoot() {
 
     html += "<div class='footer'><b>LineTracker</b> &middot; Leo Blum<br>"
             "<a href='https://data.wien.gv.at' style='color:#444'>data.wien.gv.at</a>"
-            " &middot; <a href='https://fahrplan.oebb.at' style='color:#444'>ÖBB/SCOTTY</a></div>";
+            " &middot; <a href='https://fahrplan.oebb.at' style='color:#444'>&Ouml;BB/SCOTTY</a>"
+            "<br><a href='/pong' style='color:#666'>&#127918; Pong</a></div>";
 
     html += "<script>function confirmRm(b){if(b._c){clearTimeout(b._t);b.closest('form').submit();return}"
             "b._c=1;b.innerHTML='?';b.style.background='#e53935';b.style.borderColor='#e53935';b.style.color='#fff';"
@@ -2079,6 +2129,279 @@ void handleOtaProgress() {
     server.send(200, "application/json", json);
 }
 
+// ── Pong handlers ───────────────────────────────────────────────────
+static const char PONG_PAGE[] PROGMEM = R"rawliteral(<!doctype html>
+<html lang="de"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>LineTracker Pong</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+  html,body{height:100%;background:#0a0805;color:#ffbf00;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',monospace;overflow:hidden}
+  body{display:flex;flex-direction:column;height:100vh;height:100svh}
+  header{padding:10px 14px;background:#1a1408;border-bottom:1px solid #322600;font-size:12px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+  header .me{font-weight:700;letter-spacing:.5px}
+  header .score{font-variant-numeric:tabular-nums;font-size:14px}
+  .pad{flex:1;display:flex;align-items:center;justify-content:center;font-size:48px;font-weight:700;letter-spacing:2px;background:#0a0805;border:none;color:#ffbf00;transition:background .08s}
+  .pad.up{border-bottom:1px dashed #322600}
+  .pad.down{border-top:1px dashed #322600}
+  .pad.held{background:#322600;color:#ffd24a}
+  .pad:disabled{opacity:.3}
+  footer{padding:8px 14px;background:#1a1408;border-top:1px solid #322600;font-size:11px;text-align:center;color:#a07a00}
+  .banner{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(10,8,5,.92);z-index:10;flex-direction:column;gap:14px;padding:24px;text-align:center}
+  .banner.show{display:flex}
+  .banner h1{font-size:28px;letter-spacing:1px}
+  .banner p{font-size:14px;color:#c89200}
+</style></head><body>
+<header>
+  <div class="me" id="me">verbinde…</div>
+  <div class="score" id="score">— : —</div>
+</header>
+<button class="pad up" id="up">&#9650; HOCH</button>
+<button class="pad down" id="down">&#9660; RUNTER</button>
+<footer>linetracker.local/pong &middot; halt gedrückt um zu fahren</footer>
+<div class="banner" id="banner"><h1 id="bTitle">—</h1><p id="bSub"></p></div>
+<script>
+(function(){
+  let token = localStorage.getItem('pongToken') || '';
+  let side = 'spectator';
+  let curDir = 0;
+  let lastSentDir = 0;
+
+  async function postForm(url, params){
+    const body = new URLSearchParams(params).toString();
+    const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+    return r;
+  }
+
+  async function join(){
+    try{
+      const r = await postForm('/pong/join', token ? {token} : {});
+      if(r.status === 409){
+        side = 'spectator';
+        document.getElementById('me').textContent = 'Zuschauer';
+        document.getElementById('up').disabled = true;
+        document.getElementById('down').disabled = true;
+        return;
+      }
+      const d = await r.json();
+      token = d.token; side = d.side;
+      localStorage.setItem('pongToken', token);
+      document.getElementById('me').textContent = side === 'left' ? 'Du: LINKS' : 'Du: RECHTS';
+    }catch(e){
+      document.getElementById('me').textContent = 'Verbindung fehlgeschlagen';
+    }
+  }
+
+  function setDir(d){
+    curDir = d;
+    document.getElementById('up').classList.toggle('held', d === -1);
+    document.getElementById('down').classList.toggle('held', d === 1);
+  }
+
+  function bindPad(id, dir){
+    const el = document.getElementById(id);
+    const press = e => { e.preventDefault(); if(side==='spectator') return; setDir(dir); };
+    const release = e => { e.preventDefault(); setDir(0); };
+    el.addEventListener('touchstart', press, {passive:false});
+    el.addEventListener('touchend',   release);
+    el.addEventListener('touchcancel',release);
+    el.addEventListener('mousedown',  press);
+    el.addEventListener('mouseup',    release);
+    el.addEventListener('mouseleave', release);
+  }
+  bindPad('up', -1); bindPad('down', 1);
+
+  // Send move commands while a button is held; also a heartbeat at idle
+  setInterval(()=>{
+    if(!token || side==='spectator') return;
+    if(curDir !== lastSentDir || curDir !== 0){
+      postForm('/pong/move', {token, dir: curDir}).catch(()=>{});
+      lastSentDir = curDir;
+    }
+  }, 100);
+
+  // Idle heartbeat so server keeps slot alive
+  setInterval(()=>{
+    if(!token || side==='spectator') return;
+    postForm('/pong/move', {token, dir: 0}).catch(()=>{});
+  }, 4000);
+
+  // Poll state for live score
+  async function pollState(){
+    try{
+      const r = await fetch('/pong/state');
+      const d = await r.json();
+      document.getElementById('score').textContent = d.l + ' : ' + d.r;
+      const banner = document.getElementById('banner');
+      if(d.over){
+        document.getElementById('bTitle').textContent = 'Endstation!';
+        document.getElementById('bSub').textContent = (d.win===1?'LINKS':'RECHTS') + ' gewinnt';
+        banner.classList.add('show');
+      } else {
+        banner.classList.remove('show');
+      }
+    }catch(e){}
+  }
+  setInterval(pollState, 500);
+
+  window.addEventListener('beforeunload', ()=>{
+    if(token) navigator.sendBeacon('/pong/leave', new URLSearchParams({token}).toString());
+  });
+
+  join();
+})();
+</script>
+</body></html>)rawliteral";
+
+static void pongFillToken(char out[9]) {
+    static const char* hex = "0123456789abcdef";
+    uint32_t a = esp_random();
+    uint32_t b = esp_random();
+    for (int i = 0; i < 4; i++) { out[i]     = hex[(a >> (i * 4)) & 0xF]; }
+    for (int i = 0; i < 4; i++) { out[i + 4] = hex[(b >> (i * 4)) & 0xF]; }
+    out[8] = 0;
+}
+
+static PongPlayer* pongPlayerByToken(const String& tk) {
+    if (tk.length() != 8) return nullptr;
+    if (pong.left.active  && tk == pong.left.token)  return &pong.left;
+    if (pong.right.active && tk == pong.right.token) return &pong.right;
+    return nullptr;
+}
+
+void handlePongPage() {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send_P(200, "text/html; charset=utf-8", PONG_PAGE);
+}
+
+void handlePongJoin() {
+    if (!pongMutex) { server.send(503, "text/plain", "not ready"); return; }
+    if (xSemaphoreTake(pongMutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+        server.send(503, "text/plain", "busy"); return;
+    }
+
+    unsigned long now = millis();
+
+    // If client sent an existing token, refresh that slot instead of taking a new one
+    String tk = server.arg("token");
+    PongPlayer* existing = pongPlayerByToken(tk);
+    if (existing) {
+        existing->lastSeenMs  = now;
+        existing->lastInputMs = now;
+        const char* side = (existing == &pong.left) ? "left" : "right";
+        String json = String("{\"side\":\"") + side + "\",\"token\":\"" + existing->token + "\"}";
+        xSemaphoreGive(pongMutex);
+        server.send(200, "application/json", json);
+        return;
+    }
+
+    // Reclaim stale slots
+    if (pong.left.active  && now - pong.left.lastSeenMs  > PONG_PLAYER_TIMEOUT_MS) {
+        pong.left.active = false; pong.left.token[0] = 0;
+    }
+    if (pong.right.active && now - pong.right.lastSeenMs > PONG_PLAYER_TIMEOUT_MS) {
+        pong.right.active = false; pong.right.token[0] = 0;
+    }
+
+    PongPlayer* slot = nullptr;
+    const char* sideStr = nullptr;
+    if (!pong.left.active)        { slot = &pong.left;  sideStr = "left"; }
+    else if (!pong.right.active)  { slot = &pong.right; sideStr = "right"; }
+
+    if (!slot) {
+        xSemaphoreGive(pongMutex);
+        server.send(409, "application/json", "{\"error\":\"full\"}");
+        return;
+    }
+
+    pongFillToken(slot->token);
+    slot->active      = true;
+    slot->inputDir    = 0;
+    slot->lastInputMs = now;
+    slot->lastSeenMs  = now;
+
+    appMode = MODE_PONG;
+
+    String json = String("{\"side\":\"") + sideStr + "\",\"token\":\"" + slot->token + "\"}";
+    xSemaphoreGive(pongMutex);
+    server.send(200, "application/json", json);
+}
+
+void handlePongMove() {
+    if (!pongMutex) { server.send(503, "text/plain", "not ready"); return; }
+    if (xSemaphoreTake(pongMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        server.send(503, "text/plain", "busy"); return;
+    }
+
+    String tk = server.arg("token");
+    int dir = server.arg("dir").toInt();
+    if (dir < -1) dir = -1;
+    if (dir > 1)  dir = 1;
+
+    PongPlayer* p = pongPlayerByToken(tk);
+    if (!p) {
+        xSemaphoreGive(pongMutex);
+        server.send(401, "text/plain", "bad token");
+        return;
+    }
+
+    unsigned long now = millis();
+    p->inputDir    = (int8_t)dir;
+    p->lastInputMs = now;
+    p->lastSeenMs  = now;
+
+    xSemaphoreGive(pongMutex);
+    server.send(204, "text/plain", "");
+}
+
+void handlePongState() {
+    if (!pongMutex) { server.send(503, "text/plain", "not ready"); return; }
+    if (xSemaphoreTake(pongMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        server.send(503, "text/plain", "busy"); return;
+    }
+
+    String tk = server.arg("token");
+    const char* side = "spectator";
+    PongPlayer* p = pongPlayerByToken(tk);
+    if (p) side = (p == &pong.left) ? "left" : "right";
+
+    String json = "{";
+    json += "\"l\":" + String(pong.leftScore) + ",";
+    json += "\"r\":" + String(pong.rightScore) + ",";
+    json += "\"running\":" + String(pong.gameRunning ? "true" : "false") + ",";
+    json += "\"over\":" + String(pong.gameOver ? "true" : "false") + ",";
+    json += "\"win\":" + String(pong.winner) + ",";
+    json += "\"side\":\"" + String(side) + "\"";
+    json += "}";
+
+    xSemaphoreGive(pongMutex);
+    server.send(200, "application/json", json);
+}
+
+void handlePongLeave() {
+    if (!pongMutex) { server.send(204, "text/plain", ""); return; }
+    if (xSemaphoreTake(pongMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        server.send(204, "text/plain", ""); return;
+    }
+
+    String tk = server.arg("token");
+    PongPlayer* p = pongPlayerByToken(tk);
+    if (p) {
+        p->active = false;
+        p->token[0] = 0;
+        p->inputDir = 0;
+    }
+    if (!pong.left.active && !pong.right.active) {
+        pong.gameRunning = false;
+        pong.gameOver    = false;
+        appMode          = MODE_DEPARTURES;
+    }
+
+    xSemaphoreGive(pongMutex);
+    server.send(204, "text/plain", "");
+}
+
 void startConfigServer() {
     server.on("/", handleRoot);
     server.on("/search", handleSearch);
@@ -2100,6 +2423,11 @@ void startConfigServer() {
     server.on("/update-status", handleOtaStatus);
     server.on("/update-now", handleOtaDoUpdate);
     server.on("/update-progress", handleOtaProgress);
+    server.on("/pong", HTTP_GET, handlePongPage);
+    server.on("/pong/join",  HTTP_POST, handlePongJoin);
+    server.on("/pong/move",  HTTP_POST, handlePongMove);
+    server.on("/pong/state", HTTP_GET,  handlePongState);
+    server.on("/pong/leave", HTTP_POST, handlePongLeave);
     server.on("/crash", []() {
         String html = FPSTR(HTML_HEAD);
         html += "<div class='card'><h2>Crash Log</h2>";
@@ -2610,10 +2938,247 @@ void drawGlowText(TFT_eSprite& spr, int x, int y, const String& text) {
     spr.setCursor(x, y); spr.print(text);
 }
 
+// ── Pong: physics tick ───────────────────────────────────────────────
+static void resetPongBall(int direction) {
+    pong.ballX  = SCREEN_W / 2 - PONG_BALL_SIZE / 2;
+    pong.ballY  = SCREEN_H / 2 - PONG_BALL_SIZE / 2;
+    pong.ballVX = direction >= 0 ? 2 : -2;
+    pong.ballVY = (esp_random() & 1) ? 1 : -1;
+}
+
+static void resetPongMatch() {
+    pong.leftScore  = 0;
+    pong.rightScore = 0;
+    pong.gameOver   = false;
+    pong.winner     = 0;
+    pong.gameOverMs = 0;
+    pong.leftPaddleY  = (SCREEN_H - PONG_PADDLE_H) / 2;
+    pong.rightPaddleY = (SCREEN_H - PONG_PADDLE_H) / 2;
+    resetPongBall((esp_random() & 1) ? 1 : -1);
+}
+
+void pongTick() {
+    if (!pongMutex) return;
+    if (xSemaphoreTake(pongMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+
+    unsigned long now = millis();
+
+    // Idle inputs that haven't been refreshed recently — stops paddle drift
+    if (pong.left.active && now - pong.left.lastInputMs > 500)  pong.left.inputDir  = 0;
+    if (pong.right.active && now - pong.right.lastInputMs > 500) pong.right.inputDir = 0;
+
+    // Slot timeout: a player who hasn't pinged at all for PLAYER_TIMEOUT_MS becomes free
+    if (pong.left.active  && now - pong.left.lastSeenMs  > PONG_PLAYER_TIMEOUT_MS) {
+        pong.left.active = false; pong.left.token[0] = 0; pong.left.inputDir = 0;
+    }
+    if (pong.right.active && now - pong.right.lastSeenMs > PONG_PLAYER_TIMEOUT_MS) {
+        pong.right.active = false; pong.right.token[0] = 0; pong.right.inputDir = 0;
+    }
+
+    // Both gone for ABANDON_TIMEOUT_MS → back to departures, clean slate
+    if (!pong.left.active && !pong.right.active) {
+        unsigned long lastSeen = max(pong.left.lastSeenMs, pong.right.lastSeenMs);
+        if (lastSeen > 0 && now - lastSeen > PONG_ABANDON_TIMEOUT_MS) {
+            resetPongMatch();
+            pong.gameRunning = false;
+            appMode = MODE_DEPARTURES;
+        }
+    }
+
+    // Game starts only when both slots are taken
+    bool bothActive = pong.left.active && pong.right.active;
+    if (bothActive && !pong.gameRunning && !pong.gameOver) {
+        resetPongMatch();
+        pong.gameRunning = true;
+    }
+    if (!bothActive) {
+        pong.gameRunning = false;
+    }
+
+    // Game-over hold: show banner for PONG_GAMEOVER_HOLD_MS, then start a new match
+    if (pong.gameOver && now - pong.gameOverMs > PONG_GAMEOVER_HOLD_MS) {
+        if (bothActive) {
+            resetPongMatch();
+            pong.gameRunning = true;
+        } else {
+            pong.gameOver = false;
+            pong.winner = 0;
+        }
+    }
+
+    if (pong.gameRunning && !pong.gameOver) {
+        // Paddel-Update
+        pong.leftPaddleY  += pong.left.inputDir  * PONG_PADDLE_SPEED;
+        pong.rightPaddleY += pong.right.inputDir * PONG_PADDLE_SPEED;
+        if (pong.leftPaddleY  < 0) pong.leftPaddleY  = 0;
+        if (pong.rightPaddleY < 0) pong.rightPaddleY = 0;
+        if (pong.leftPaddleY  > SCREEN_H - PONG_PADDLE_H) pong.leftPaddleY  = SCREEN_H - PONG_PADDLE_H;
+        if (pong.rightPaddleY > SCREEN_H - PONG_PADDLE_H) pong.rightPaddleY = SCREEN_H - PONG_PADDLE_H;
+
+        // Ball-Update
+        pong.ballX += pong.ballVX;
+        pong.ballY += pong.ballVY;
+
+        // Wall bounce (top/bottom)
+        if (pong.ballY <= 0) { pong.ballY = 0; pong.ballVY = -pong.ballVY; }
+        if (pong.ballY >= SCREEN_H - PONG_BALL_SIZE) {
+            pong.ballY = SCREEN_H - PONG_BALL_SIZE;
+            pong.ballVY = -pong.ballVY;
+        }
+
+        // Paddle collision
+        const int leftPaddleX  = PX_MARGIN;
+        const int rightPaddleX = SCREEN_W - PX_MARGIN - PONG_PADDLE_W;
+
+        if (pong.ballVX < 0 &&
+            pong.ballX <= leftPaddleX + PONG_PADDLE_W &&
+            pong.ballX + PONG_BALL_SIZE >= leftPaddleX &&
+            pong.ballY + PONG_BALL_SIZE >= pong.leftPaddleY &&
+            pong.ballY <= pong.leftPaddleY + PONG_PADDLE_H) {
+            pong.ballX = leftPaddleX + PONG_PADDLE_W;
+            pong.ballVX = -pong.ballVX;
+            int hitOffset = (pong.ballY + PONG_BALL_SIZE / 2) - (pong.leftPaddleY + PONG_PADDLE_H / 2);
+            pong.ballVY += hitOffset / 8;
+            if (pong.ballVY > 3)  pong.ballVY = 3;
+            if (pong.ballVY < -3) pong.ballVY = -3;
+        }
+
+        if (pong.ballVX > 0 &&
+            pong.ballX + PONG_BALL_SIZE >= rightPaddleX &&
+            pong.ballX <= rightPaddleX + PONG_PADDLE_W &&
+            pong.ballY + PONG_BALL_SIZE >= pong.rightPaddleY &&
+            pong.ballY <= pong.rightPaddleY + PONG_PADDLE_H) {
+            pong.ballX = rightPaddleX - PONG_BALL_SIZE;
+            pong.ballVX = -pong.ballVX;
+            int hitOffset = (pong.ballY + PONG_BALL_SIZE / 2) - (pong.rightPaddleY + PONG_PADDLE_H / 2);
+            pong.ballVY += hitOffset / 8;
+            if (pong.ballVY > 3)  pong.ballVY = 3;
+            if (pong.ballVY < -3) pong.ballVY = -3;
+        }
+
+        // Goal
+        if (pong.ballX + PONG_BALL_SIZE < 0) {
+            pong.rightScore++;
+            if (pong.rightScore >= PONG_SCORE_TO_WIN) {
+                pong.gameOver = true; pong.winner = 2; pong.gameOverMs = now;
+                pong.gameRunning = false;
+            } else {
+                resetPongBall(-1);  // ball heads to the player who just lost (left)
+            }
+        } else if (pong.ballX > SCREEN_W) {
+            pong.leftScore++;
+            if (pong.leftScore >= PONG_SCORE_TO_WIN) {
+                pong.gameOver = true; pong.winner = 1; pong.gameOverMs = now;
+                pong.gameRunning = false;
+            } else {
+                resetPongBall(1);   // ball heads to the player who just lost (right)
+            }
+        }
+    }
+
+    xSemaphoreGive(pongMutex);
+}
+
+// ── Pong: render scene ───────────────────────────────────────────────
+// Caller must have created the sprite already; we draw on top and let
+// drawDisplay finish with pushSprite/deleteSprite.
+void drawPongScene() {
+    // Snapshot state under mutex so the draw is consistent even if a web
+    // handler updates inputs mid-frame.
+    PongState s;
+    bool bothActive = false;
+    if (pongMutex && xSemaphoreTake(pongMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        s = pong;
+        bothActive = pong.left.active && pong.right.active;
+        xSemaphoreGive(pongMutex);
+    } else {
+        s = pong;
+    }
+
+    sprite.fillSprite(BG_COLOR);
+
+    // U-Bahn track lines (top + bottom dashed rails)
+    for (int x = 0; x < SCREEN_W; x += 6) {
+        sprite.drawFastHLine(x,     2,             3, AMBER_DIM);
+        sprite.drawFastHLine(x,     SCREEN_H - 3,  3, AMBER_DIM);
+    }
+
+    // Center dashed line
+    for (int y = 18; y < SCREEN_H - 6; y += 8) {
+        sprite.drawFastVLine(SCREEN_W / 2, y, 4, AMBER_DIM);
+    }
+
+    // Score (Stationsname progression) — top bar
+    sprite.setTextFont(1);
+    sprite.setTextSize(1);
+    sprite.setTextColor(AMBER, BG_COLOR);
+    int leftIdx  = s.leftScore  < (int)(sizeof(PONG_STATIONS)/sizeof(PONG_STATIONS[0])) ? s.leftScore  : 5;
+    int rightIdx = s.rightScore < (int)(sizeof(PONG_STATIONS)/sizeof(PONG_STATIONS[0])) ? s.rightScore : 5;
+    String leftName  = String(PONG_STATIONS[leftIdx])  + " " + String(s.leftScore);
+    String rightName = String(s.rightScore) + " " + String(PONG_STATIONS[rightIdx]);
+    sprite.setCursor(6, 8);
+    sprite.print(leftName);
+    int rw = sprite.textWidth(rightName);
+    sprite.setCursor(SCREEN_W - rw - 6, 8);
+    sprite.print(rightName);
+
+    // Helper lambda: draw a paddle styled as a U-Bahn-Waggon
+    auto drawWaggon = [](int x, int y, bool dim) {
+        uint16_t col = dim ? AMBER_DIM : AMBER;
+        sprite.drawRect(x, y, PONG_PADDLE_W, PONG_PADDLE_H, col);
+        // Tiny windows along the side (3 dots)
+        for (int wy = 6; wy < PONG_PADDLE_H - 4; wy += 12) {
+            sprite.fillRect(x + 2, y + wy, 2, 2, col);
+        }
+        // Headlight at the top
+        sprite.drawFastHLine(x + 1, y, PONG_PADDLE_W - 2, col);
+    };
+
+    drawWaggon(PX_MARGIN,                         s.leftPaddleY,  !s.left.active);
+    drawWaggon(SCREEN_W - PX_MARGIN - PONG_PADDLE_W, s.rightPaddleY, !s.right.active);
+
+    // Ball = Fahrgast (with tiny glow halo)
+    sprite.fillRect(s.ballX - 1, s.ballY - 1, PONG_BALL_SIZE + 2, PONG_BALL_SIZE + 2, AMBER_DIM);
+    sprite.fillRect(s.ballX,     s.ballY,     PONG_BALL_SIZE,     PONG_BALL_SIZE,     AMBER);
+
+    // Overlays
+    sprite.setTextFont(1);
+    if (!bothActive && !s.gameOver) {
+        sprite.setTextSize(2);
+        const char* msg = "Warte auf Mitspieler...";
+        int tw = sprite.textWidth(msg);
+        drawGlowText(sprite, (SCREEN_W - tw) / 2, SCREEN_H / 2 - 14, msg);
+        sprite.setTextSize(1);
+        const char* hint = "linetracker.local/pong";
+        int hw = sprite.textWidth(hint);
+        sprite.setTextColor(AMBER_DIM, BG_COLOR);
+        sprite.setCursor((SCREEN_W - hw) / 2, SCREEN_H / 2 + 8);
+        sprite.print(hint);
+    } else if (s.gameOver) {
+        sprite.setTextSize(2);
+        const char* line1 = "Endstation!";
+        int tw1 = sprite.textWidth(line1);
+        drawGlowText(sprite, (SCREEN_W - tw1) / 2, SCREEN_H / 2 - 22, line1);
+        String line2 = String(s.winner == 1 ? "Links" : "Rechts") + " gewinnt: " +
+                        String(PONG_STATIONS[5]);
+        sprite.setTextSize(1);
+        int tw2 = sprite.textWidth(line2);
+        drawGlowText(sprite, (SCREEN_W - tw2) / 2, SCREEN_H / 2 + 4, line2);
+    }
+}
+
 void drawDisplay() {
     sprite.createSprite(SCREEN_W, SCREEN_H);
     sprite.fillSprite(BG_COLOR);
     sprite.setTextFont(1);
+
+    // ── Pong takeover ──
+    if (appMode == MODE_PONG) {
+        drawPongScene();
+        sprite.pushSprite(0, 0);
+        sprite.deleteSprite();
+        return;
+    }
 
     // ── OTA update progress screen ──
     if (otaInProgress) {
@@ -3137,6 +3702,7 @@ void dataTask(void* param) {
 void displayTask(void* param) {
     unsigned long lastNightCheck = 0;
     for (;;) {
+        if (appMode == MODE_PONG) pongTick();
         drawDisplay();
         if (millis() - lastNightCheck > 10000) {
             applyNightMode();
@@ -3284,6 +3850,7 @@ void setup() {
 
     // Start display task immediately so setup screen with IP shows
     dataMutex = xSemaphoreCreateMutex();
+    pongMutex = xSemaphoreCreateMutex();
     xTaskCreatePinnedToCore(displayTask, "display", 8192,  NULL, 1, NULL, 1);
 
     // NTP config (sync happens in background, no blocking wait)
