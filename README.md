@@ -6,7 +6,6 @@ von Leo Blum
 
 ---
 
-![LineTracker Display](reference_design.png)
 
 LineTracker verwandelt ein LILYGO T-Display-S3 in einen kompakten Abfahrtsmonitor im Amber-Dot-Matrix-Look – genau wie die Anzeigetafeln an Wiens U-Bahn- und Straßenbahnstationen. Einmal einrichten, fertig. Kein Code anfassen, kein Technikkenntnisse nötig.
 
