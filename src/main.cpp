@@ -98,7 +98,7 @@ void saveCrashInfo() {
 }
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.4.0"
+#define FW_VERSION "1.5.0"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -169,7 +169,7 @@ static volatile bool portalOpen     = false;
 static volatile bool portalShouldOpen = false;
 
 // ── Pong (2-Player Easter Egg) ───────────────────────────────────────
-enum AppMode { MODE_DEPARTURES = 0, MODE_PONG = 1 };
+enum AppMode { MODE_DEPARTURES = 0, MODE_PONG = 1, MODE_SNAKE = 2 };
 static volatile AppMode appMode = MODE_DEPARTURES;
 
 struct PongPlayer {
@@ -226,6 +226,42 @@ static const char* PONG_STATIONS[] = {
     "Karlsplatz", "Stephansplatz", "Schwedenplatz",
     "Praterstern", "Schottenring", "Heiligenstadt"
 };
+
+// ── Snake (1-Player Easter Egg, U-Bahn-themed) ──────────────────────
+static const int SNAKE_CELL    = 10;
+static const int SNAKE_HEADER  = 18;       // top strip for score
+static const int SNAKE_COLS    = 32;       // 320 / 10
+static const int SNAKE_ROWS    = 15;       // (170 - 18) / 10 ≈ 15
+static const int SNAKE_MAX_LEN = 80;
+static const unsigned long SNAKE_PLAYER_TIMEOUT_MS  = 15000;
+static const unsigned long SNAKE_ABANDON_TIMEOUT_MS = 30000;
+static const unsigned long SNAKE_GAMEOVER_HOLD_MS   = 5000;
+static const int SNAKE_TICK_START_MS = 230;
+static const int SNAKE_TICK_MIN_MS   = 90;
+
+struct SnakeCell { int8_t x, y; };
+
+struct SnakeState {
+    bool          active        = false;
+    char          token[9]      = {0};
+    int8_t        dir           = 0;        // 0=right 1=down 2=left 3=up
+    int8_t        pendingDir    = 0;        // queued input for next tick
+    unsigned long lastSeenMs    = 0;
+    unsigned long lastInputMs   = 0;
+    unsigned long lastTickMs    = 0;
+    int           tickIntervalMs = SNAKE_TICK_START_MS;
+    SnakeCell     body[SNAKE_MAX_LEN];      // body[0] = tail, body[len-1] = head
+    int           length        = 0;
+    SnakeCell     food          = {0, 0};
+    int           score         = 0;
+    int           highScore     = 0;
+    bool          gameRunning   = false;
+    bool          gameOver      = false;
+    unsigned long gameOverMs    = 0;
+    unsigned long deathFlashMs  = 0;
+};
+static SnakeState snake;
+static SemaphoreHandle_t snakeMutex = nullptr;
 
 void loadDirCache() {
     if (!SPIFFS.exists(DIR_CACHE_PATH)) return;
@@ -307,6 +343,7 @@ struct ConfigLine {
     String name;
     String towards;
     String type;
+    int    walkMin = 0;  // minutes to walk to stop (0 = off, otherwise show JETZT when countdown<=walkMin)
 };
 static std::vector<ConfigLine> cfgLines;
 
@@ -314,6 +351,7 @@ struct OebbStation {
     String stationName;  // canonical ÖBB station name (e.g. "Wien Rennweg")
     String line;         // e.g. "S 3", "REX 7"
     String towards;      // destination direction
+    int    walkMin = 0;
 };
 static std::vector<OebbStation> cfgOebb;
 
@@ -325,6 +363,7 @@ struct WatchGroupEntry {
     String lineName;
     String towards;
     String type;
+    int    walkMin = 0;
 };
 struct WatchGroup {
     String label;
@@ -352,6 +391,9 @@ bool loadConfig() {
             cl.name    = line["name"] | "";
             cl.towards = line["towards"] | "";
             cl.type    = line["type"] | "";
+            cl.walkMin = line["walk"]  | 0;
+            if (cl.walkMin < 0)  cl.walkMin = 0;
+            if (cl.walkMin > 30) cl.walkMin = 30;
             if (cl.rbl.length() > 0) cfgLines.push_back(cl);
         }
     } else if (doc["rbls"].is<String>()) {
@@ -371,6 +413,9 @@ bool loadConfig() {
             os.stationName = stn["station"].as<String>();
             os.line        = stn["line"] | "";
             os.towards     = stn["towards"] | "";
+            os.walkMin     = stn["walk"]  | 0;
+            if (os.walkMin < 0)  os.walkMin = 0;
+            if (os.walkMin > 30) os.walkMin = 30;
             if (os.stationName.length() > 0) cfgOebb.push_back(os);
         }
     }
@@ -388,6 +433,9 @@ bool loadConfig() {
                     en.lineName    = e["line"] | "";
                     en.towards     = e["towards"] | "";
                     en.type        = e["type"] | "";
+                    en.walkMin     = e["walk"] | 0;
+                    if (en.walkMin < 0)  en.walkMin = 0;
+                    if (en.walkMin > 30) en.walkMin = 30;
                     if (en.lineName.length() > 0) g.entries.push_back(en);
                 }
             }
@@ -425,6 +473,7 @@ void saveConfig() {
         obj["name"]    = cl.name;
         obj["towards"] = cl.towards;
         obj["type"]    = cl.type;
+        if (cl.walkMin > 0) obj["walk"] = cl.walkMin;
     }
     JsonArray oArr = doc["oebb"].to<JsonArray>();
     for (auto& os : cfgOebb) {
@@ -432,6 +481,7 @@ void saveConfig() {
         obj["station"] = os.stationName;
         obj["line"]    = os.line;
         obj["towards"] = os.towards;
+        if (os.walkMin > 0) obj["walk"] = os.walkMin;
     }
     JsonArray wgArr = doc["watch_groups"].to<JsonArray>();
     for (auto& g : cfgWatchGroups) {
@@ -447,6 +497,7 @@ void saveConfig() {
             eo["type"]    = e.type;
             if (e.source == "wl")   eo["rbl"]     = e.rbl;
             else                    eo["station"]  = e.oebbStation;
+            if (e.walkMin > 0) eo["walk"] = e.walkMin;
         }
     }
     doc["rotate_sec"]       = cfgRotateSec;
@@ -470,6 +521,7 @@ struct Departure {
     int    countdown;
     bool   realtime;
     int    watchIdx = -1; // -1 = normal, >=0 = station watch entry index
+    int    walkMin  = 0;  // resolved walk-to-stop minutes (0 = off)
 };
 
 static std::vector<Departure> departures;     // all departures (raw)
@@ -1037,6 +1089,10 @@ button{background:#f5c400;color:#0d0d0d;border:none;padding:13px 20px;border-rad
 button:hover{opacity:.88;transform:translateY(-1px)}
 button:active{transform:scale(.98);opacity:.8}
 button.add{background:#2e7d32;color:#fff}
+.walk{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:#686868;flex-shrink:0;margin-right:2px}
+.walk input[type=number]{width:38px;padding:6px 4px;text-align:center;font-size:12px;background:#181818;border:1px solid rgba(245,196,0,.18);color:#f5c400;font-family:'Courier New',Courier,monospace}
+.walk input[type=number].on{border-color:rgba(245,196,0,.6);background:#221b00}
+.walk .lbl{font-size:10px;line-height:1;letter-spacing:.5px;text-transform:uppercase}
 .rm{background:transparent;border:1px solid rgba(229,57,53,.5);color:#e53935;width:34px;min-width:34px;height:34px;padding:0;font-size:14px;margin:0;border-radius:4px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .15s,color .15s,border-color .15s}
 .rm:hover{background:#e53935;color:#fff;border-color:#e53935}
 .btn-secondary{background:#252525;color:#ccc;font-weight:500;border:1px solid rgba(255,255,255,.1)}
@@ -1144,6 +1200,16 @@ void handleSettingsPage() {
     html += "<button type='submit' style='margin-top:16px'>Speichern</button>";
     html += "</form></div>";
 
+    // ── Easter Eggs ───────────────────────────────────────────────────────
+    html += "<div class='card'>";
+    html += "<h2 style='margin-bottom:12px'>Spiele</h2>";
+    html += "<p class='hint' style='margin-bottom:10px'>Auf einem zweiten Gerät öffnen — das Display übernimmt das Spiel.</p>";
+    html += "<a href='/pong'><button class='btn-secondary' style='margin-bottom:8px;text-align:left;display:flex;align-items:center;gap:10px;justify-content:flex-start'>"
+            "<span style='font-size:18px'>&#127918;</span><span>Pong <span style='color:#686868;font-size:11px;font-weight:400'>&middot; 2 Spieler</span></span></button></a>";
+    html += "<a href='/snake'><button class='btn-secondary' style='text-align:left;display:flex;align-items:center;gap:10px;justify-content:flex-start'>"
+            "<span style='font-size:18px'>&#128012;</span><span>Snake <span style='color:#686868;font-size:11px;font-weight:400'>&middot; 1 Spieler &middot; U-Bahn</span></span></button></a>";
+    html += "</div>";
+
     // ── System ────────────────────────────────────────────────────────────
     html += "<div class='card'>";
     html += "<h2 style='margin-bottom:12px'>System</h2>";
@@ -1203,6 +1269,10 @@ void handleRoot() {
                 html += "<div class='line-item'>";
                 html += "<span class='" + badgeClassForType(cl.type) + "'>" + cl.name + "</span>";
                 html += "<div class='dir'>" + cl.towards + "</div>";
+                html += "<label class='walk' title='Gehweg zum Stop in Minuten \\u2014 wenn Countdown \\u2264 dieser Wert, zeigt das Display JETZT'><span class='lbl'>Gehw</span>";
+                html += "<input type='number' min='0' max='30' value='" + String(cl.walkMin) +
+                        "' class='" + String(cl.walkMin > 0 ? "on" : "") +
+                        "' data-kind='wl' data-idx='" + String(i) + "' onchange='setWalk(this)'></label>";
                 html += "<form action='/remove' method='POST' style='margin:0'>";
                 html += "<input type='hidden' name='idx' value='" + String(i) + "'>";
                 html += "<button class='rm' type='button' onclick='confirmRm(this)'>&#x2715;</button></form>";
@@ -1222,8 +1292,12 @@ void handleRoot() {
             auto& os = cfgOebb[i];
             html += "<div class='line-item'>";
             html += "<span class='badge train'>" + os.line + "</span>";
-            html += "<div><div class='dir'>" + os.towards + "</div>";
+            html += "<div style='flex:1;min-width:0'><div class='dir'>" + os.towards + "</div>";
             html += "<div class='stop'>" + os.stationName + "</div></div>";
+            html += "<label class='walk' title='Gehweg zur Station in Minuten'><span class='lbl'>Gehw</span>";
+            html += "<input type='number' min='0' max='30' value='" + String(os.walkMin) +
+                    "' class='" + String(os.walkMin > 0 ? "on" : "") +
+                    "' data-kind='oebb' data-idx='" + String(i) + "' onchange='setWalk(this)'></label>";
             html += "<form action='/oebb-remove' method='POST' style='margin:0'>";
             html += "<input type='hidden' name='idx' value='" + String(i) + "'>";
             html += "<button class='rm' type='button' onclick='confirmRm(this)'>&#x2715;</button></form>";
@@ -1266,11 +1340,20 @@ void handleRoot() {
     html += "<div class='footer'><b>LineTracker</b> &middot; Leo Blum<br>"
             "<a href='https://data.wien.gv.at' style='color:#444'>data.wien.gv.at</a>"
             " &middot; <a href='https://fahrplan.oebb.at' style='color:#444'>&Ouml;BB/SCOTTY</a>"
-            "<br><a href='/pong' style='color:#666'>&#127918; Pong</a></div>";
+            "<br><a href='/pong' style='color:#666'>&#127918; Pong</a> &middot; "
+            "<a href='/snake' style='color:#666'>&#128012; Snake</a></div>";
 
     html += "<script>function confirmRm(b){if(b._c){clearTimeout(b._t);b.closest('form').submit();return}"
             "b._c=1;b.innerHTML='?';b.style.background='#e53935';b.style.borderColor='#e53935';b.style.color='#fff';"
-            "b._t=setTimeout(function(){b._c=0;b.innerHTML='&#x2715;';b.style.background='';b.style.borderColor='';b.style.color=''},3000)}</script>";
+            "b._t=setTimeout(function(){b._c=0;b.innerHTML='&#x2715;';b.style.background='';b.style.borderColor='';b.style.color=''},3000)}\n"
+            "function setWalk(el){var m=parseInt(el.value,10);if(isNaN(m)||m<0)m=0;if(m>30)m=30;el.value=m;"
+            "el.classList.toggle('on',m>0);"
+            "var b=new URLSearchParams({kind:el.dataset.kind,idx:el.dataset.idx,sub:(el.dataset.sub||''),min:m});"
+            "fetch('/set-walk',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b.toString()})"
+            ".then(function(r){if(!r.ok)el.style.borderColor='#e53935';else{el.style.borderColor='';"
+            "var t=document.createElement('div');t.className='toast';t.textContent=m>0?('Gehweg '+m+' min'):'Gehweg aus';"
+            "document.body.appendChild(t);setTimeout(function(){t.remove()},2500);}}).catch(function(){el.style.borderColor='#e53935'})}"
+            "</script>";
     html += "</body></html>";
     logf("[root] html built: %lums  size: %u bytes\n", millis()-t0, html.length());
     sendHtml(html);
@@ -1489,6 +1572,33 @@ void handleRemove() {
     configChanged = true;
     server.sendHeader("Location", "/");
     server.send(302);
+}
+
+// POST /set-walk — body: kind=wl|oebb|wg, idx=N, sub=M (for wg entries), min=0..30
+void handleSetWalk() {
+    String kind = server.arg("kind");
+    int idx     = server.arg("idx").toInt();
+    int sub     = server.hasArg("sub") && server.arg("sub").length() > 0 ? server.arg("sub").toInt() : -1;
+    int m       = server.arg("min").toInt();
+    if (m < 0)  m = 0;
+    if (m > 30) m = 30;
+
+    bool ok = false;
+    if (kind == "wl") {
+        if (idx >= 0 && idx < (int)cfgLines.size()) { cfgLines[idx].walkMin = m; ok = true; }
+    } else if (kind == "oebb") {
+        if (idx >= 0 && idx < (int)cfgOebb.size())  { cfgOebb[idx].walkMin  = m; ok = true; }
+    } else if (kind == "wg") {
+        if (idx >= 0 && idx < (int)cfgWatchGroups.size()) {
+            auto& g = cfgWatchGroups[idx];
+            if (sub >= 0 && sub < (int)g.entries.size()) { g.entries[sub].walkMin = m; ok = true; }
+        }
+    }
+
+    if (!ok) { server.send(400, "text/plain", "bad target"); return; }
+    saveConfig();
+    configChanged = true;
+    server.send(204);
 }
 
 // Forward declarations
@@ -2432,12 +2542,308 @@ void handlePongLeave() {
     server.send(204, "text/plain", "");
 }
 
+// ── Snake handlers ──────────────────────────────────────────────────
+static const char SNAKE_PAGE[] PROGMEM = R"rawliteral(<!doctype html>
+<html lang="de"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>LineTracker Snake</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+  html,body{height:100%;background:#0a0805;color:#ffbf00;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',monospace;overflow:hidden}
+  body{display:flex;flex-direction:column;height:100vh;height:100svh}
+  header{padding:10px 14px;background:#1a1408;border-bottom:1px solid #322600;font-size:12px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+  header .me{font-weight:700;letter-spacing:.5px}
+  header .score{font-variant-numeric:tabular-nums;font-size:14px}
+  .field{flex:1;display:flex;align-items:center;justify-content:center;background:#0a0805}
+  .pad{display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr 1fr;width:min(86vw,360px);aspect-ratio:1;gap:8px}
+  .pad button{background:#1a1408;border:1px solid #322600;color:#ffbf00;font-size:32px;font-weight:700;border-radius:10px;transition:background .08s,transform .08s}
+  .pad button.held{background:#322600;color:#ffd24a;transform:scale(.96)}
+  .pad button.spacer{visibility:hidden}
+  .up{grid-column:2;grid-row:1}
+  .left{grid-column:1;grid-row:2}
+  .right{grid-column:3;grid-row:2}
+  .down{grid-column:2;grid-row:3}
+  footer{padding:8px 14px;background:#1a1408;border-top:1px solid #322600;font-size:11px;text-align:center;color:#a07a00}
+  .banner{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(10,8,5,.92);z-index:10;flex-direction:column;gap:14px;padding:24px;text-align:center}
+  .banner.show{display:flex}
+  .banner h1{font-size:28px;letter-spacing:1px}
+  .banner p{font-size:14px;color:#c89200}
+  .hint{font-size:11px;color:#a07a00;margin-top:6px}
+</style></head><body>
+<header>
+  <div class="me" id="me">verbinde&hellip;</div>
+  <div class="score" id="score">&mdash;</div>
+</header>
+<div class="field">
+  <div class="pad">
+    <button class="up"    id="bUp">&#9650;</button>
+    <button class="left"  id="bLeft">&#9664;</button>
+    <button class="right" id="bRight">&#9654;</button>
+    <button class="down"  id="bDown">&#9660;</button>
+  </div>
+</div>
+<footer>linetracker.local/snake &middot; wische oder D-Pad</footer>
+<div class="banner" id="banner"><h1 id="bTitle">&mdash;</h1><p id="bSub"></p></div>
+<script>
+(function(){
+  let token = localStorage.getItem('snakeToken') || '';
+  let mine = false;
+
+  async function postForm(url, params){
+    const body = new URLSearchParams(params).toString();
+    return fetch(url, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+  }
+  async function join(){
+    try{
+      const r = await postForm('/snake/join', token ? {token} : {});
+      if(r.status === 409){
+        mine = false;
+        document.getElementById('me').textContent = 'Belegt';
+        ['bUp','bDown','bLeft','bRight'].forEach(id=>document.getElementById(id).disabled = true);
+        return;
+      }
+      const d = await r.json();
+      token = d.token; mine = true;
+      localStorage.setItem('snakeToken', token);
+      document.getElementById('me').textContent = 'Du fährst';
+    }catch(e){
+      document.getElementById('me').textContent = 'Verbindung fehlgeschlagen';
+    }
+  }
+  function send(dir){
+    if(!mine || !token) return;
+    if(navigator.vibrate) navigator.vibrate(15);
+    postForm('/snake/move', {token, dir}).catch(()=>{});
+  }
+  function bind(id, dir){
+    const el = document.getElementById(id);
+    const press = e => { e.preventDefault(); el.classList.add('held'); send(dir); };
+    const release = e => { e.preventDefault(); el.classList.remove('held'); };
+    el.addEventListener('touchstart', press, {passive:false});
+    el.addEventListener('touchend',   release);
+    el.addEventListener('touchcancel',release);
+    el.addEventListener('mousedown',  press);
+    el.addEventListener('mouseup',    release);
+    el.addEventListener('mouseleave', release);
+  }
+  bind('bUp', 3); bind('bDown', 1); bind('bLeft', 2); bind('bRight', 0);
+
+  // Swipe on the field
+  let sx=0, sy=0, st=0;
+  const field = document.querySelector('.field');
+  field.addEventListener('touchstart', e => { const t=e.touches[0]; sx=t.clientX; sy=t.clientY; st=Date.now(); }, {passive:true});
+  field.addEventListener('touchend', e => {
+    const t=e.changedTouches[0]; const dx=t.clientX-sx, dy=t.clientY-sy;
+    if(Date.now()-st > 600) return;
+    if(Math.abs(dx) < 24 && Math.abs(dy) < 24) return;
+    if(Math.abs(dx) > Math.abs(dy))  send(dx > 0 ? 0 : 2);
+    else                              send(dy > 0 ? 1 : 3);
+  });
+
+  // Keyboard for desktop testing
+  document.addEventListener('keydown', e => {
+    const m = {ArrowUp:3, ArrowDown:1, ArrowLeft:2, ArrowRight:0, w:3, s:1, a:2, d:0};
+    if(m[e.key] !== undefined) { e.preventDefault(); send(m[e.key]); }
+  });
+
+  // Heartbeat
+  setInterval(()=>{ if(!token||!mine) return; postForm('/snake/move', {token, dir:-1}).catch(()=>{}); }, 4000);
+
+  let prevScore = 0, prevOver = false;
+  async function poll(){
+    try{
+      const r = await fetch('/snake/state');
+      const d = await r.json();
+      document.getElementById('score').textContent = String(d.score) + ' / best ' + d.best;
+      if(d.score > prevScore && navigator.vibrate) navigator.vibrate([20,10,20]);
+      prevScore = d.score;
+      const banner = document.getElementById('banner');
+      if(d.over){
+        if(!prevOver && navigator.vibrate) navigator.vibrate([100,80,200]);
+        document.getElementById('bTitle').textContent = 'Endstation';
+        document.getElementById('bSub').textContent = 'Score ' + d.score + ' — startet neu';
+        banner.classList.add('show');
+      } else {
+        banner.classList.remove('show');
+      }
+      prevOver = d.over;
+    }catch(e){}
+  }
+  setInterval(poll, 500);
+
+  window.addEventListener('beforeunload', ()=>{
+    if(token) navigator.sendBeacon('/snake/leave', new URLSearchParams({token}).toString());
+  });
+  join();
+})();
+</script>
+</body></html>)rawliteral";
+
+static void snakeFillToken(char out[9]) {
+    static const char* hex = "0123456789abcdef";
+    uint32_t a = esp_random();
+    uint32_t b = esp_random();
+    for (int i = 0; i < 4; i++) { out[i]     = hex[(a >> (i * 4)) & 0xF]; }
+    for (int i = 0; i < 4; i++) { out[i + 4] = hex[(b >> (i * 4)) & 0xF]; }
+    out[8] = 0;
+}
+
+// Caller must hold snakeMutex.
+static bool snakeBodyContains(int x, int y) {
+    for (int i = 0; i < snake.length; i++) {
+        if (snake.body[i].x == x && snake.body[i].y == y) return true;
+    }
+    return false;
+}
+
+// Caller must hold snakeMutex.
+static void snakePlaceFood() {
+    if (snake.length >= SNAKE_COLS * SNAKE_ROWS) return;
+    for (int tries = 0; tries < 200; tries++) {
+        int x = esp_random() % SNAKE_COLS;
+        int y = esp_random() % SNAKE_ROWS;
+        if (!snakeBodyContains(x, y)) { snake.food.x = x; snake.food.y = y; return; }
+    }
+}
+
+// Caller must hold snakeMutex.
+static void snakeResetMatch() {
+    int cx = SNAKE_COLS / 2;
+    int cy = SNAKE_ROWS / 2;
+    snake.length = 3;
+    snake.body[0] = {(int8_t)(cx - 2), (int8_t)cy};  // tail
+    snake.body[1] = {(int8_t)(cx - 1), (int8_t)cy};
+    snake.body[2] = {(int8_t)cx,       (int8_t)cy};  // head
+    snake.dir = 0;          // moving right
+    snake.pendingDir = 0;
+    snake.score = 0;
+    snake.gameOver = false;
+    snake.gameOverMs = 0;
+    snake.deathFlashMs = 0;
+    snake.tickIntervalMs = SNAKE_TICK_START_MS;
+    snake.lastTickMs = millis();
+    snakePlaceFood();
+}
+
+void handleSnakePage() {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send_P(200, "text/html; charset=utf-8", SNAKE_PAGE);
+}
+
+void handleSnakeJoin() {
+    if (!snakeMutex) { server.send(503, "text/plain", "not ready"); return; }
+    if (xSemaphoreTake(snakeMutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+        server.send(503, "text/plain", "busy"); return;
+    }
+
+    unsigned long now = millis();
+    String tk = server.arg("token");
+
+    // Refresh existing slot
+    if (snake.active && tk.length() == 8 && tk == snake.token) {
+        snake.lastSeenMs  = now;
+        snake.lastInputMs = now;
+        String json = String("{\"token\":\"") + snake.token + "\"}";
+        xSemaphoreGive(snakeMutex);
+        server.send(200, "application/json", json);
+        return;
+    }
+
+    // Reclaim stale slot
+    if (snake.active && now - snake.lastSeenMs > SNAKE_PLAYER_TIMEOUT_MS) {
+        snake.active = false; snake.token[0] = 0;
+    }
+
+    if (snake.active) {
+        xSemaphoreGive(snakeMutex);
+        server.send(409, "application/json", "{\"error\":\"busy\"}");
+        return;
+    }
+
+    snakeFillToken(snake.token);
+    snake.active      = true;
+    snake.lastInputMs = now;
+    snake.lastSeenMs  = now;
+    snakeResetMatch();
+    snake.gameRunning = true;
+    appMode = MODE_SNAKE;
+
+    String json = String("{\"token\":\"") + snake.token + "\"}";
+    xSemaphoreGive(snakeMutex);
+    server.send(200, "application/json", json);
+}
+
+void handleSnakeMove() {
+    if (!snakeMutex) { server.send(503, "text/plain", "not ready"); return; }
+    if (xSemaphoreTake(snakeMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        server.send(503, "text/plain", "busy"); return;
+    }
+
+    String tk = server.arg("token");
+    if (!snake.active || tk.length() != 8 || tk != snake.token) {
+        xSemaphoreGive(snakeMutex);
+        server.send(401, "text/plain", "bad token");
+        return;
+    }
+
+    int dir = server.arg("dir").toInt();
+    unsigned long now = millis();
+    snake.lastInputMs = now;
+    snake.lastSeenMs  = now;
+
+    // dir == -1 is just heartbeat
+    if (dir >= 0 && dir <= 3) {
+        // Reject reversal (dir is opposite of current dir → would suicide)
+        int opp = (snake.dir + 2) & 3;
+        if (dir != opp || snake.length <= 1) {
+            snake.pendingDir = (int8_t)dir;
+        }
+    }
+
+    xSemaphoreGive(snakeMutex);
+    server.send(204, "text/plain", "");
+}
+
+void handleSnakeState() {
+    if (!snakeMutex) { server.send(503, "text/plain", "not ready"); return; }
+    if (xSemaphoreTake(snakeMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        server.send(503, "text/plain", "busy"); return;
+    }
+    String json = "{";
+    json += "\"score\":"   + String(snake.score) + ",";
+    json += "\"best\":"    + String(snake.highScore) + ",";
+    json += "\"running\":" + String(snake.gameRunning ? "true" : "false") + ",";
+    json += "\"over\":"    + String(snake.gameOver ? "true" : "false");
+    json += "}";
+    xSemaphoreGive(snakeMutex);
+    server.send(200, "application/json", json);
+}
+
+void handleSnakeLeave() {
+    if (!snakeMutex) { server.send(204, "text/plain", ""); return; }
+    if (xSemaphoreTake(snakeMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        server.send(204, "text/plain", ""); return;
+    }
+    String tk = server.arg("token");
+    if (snake.active && tk.length() == 8 && tk == snake.token) {
+        snake.active      = false;
+        snake.token[0]    = 0;
+        snake.gameRunning = false;
+        snake.gameOver    = false;
+        appMode = MODE_DEPARTURES;
+    }
+    xSemaphoreGive(snakeMutex);
+    server.send(204, "text/plain", "");
+}
+
 void startConfigServer() {
     server.on("/", handleRoot);
     server.on("/search", handleSearch);
     server.on("/browse", handleBrowse);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/remove", HTTP_POST, handleRemove);
+    server.on("/set-walk", HTTP_POST, handleSetWalk);
     server.on("/settings", HTTP_GET, handleSettingsPage);
     server.on("/settings", HTTP_POST, handleSettings);
     server.on("/oebb-search", handleOebbSearch);
@@ -2458,6 +2864,11 @@ void startConfigServer() {
     server.on("/pong/move",  HTTP_POST, handlePongMove);
     server.on("/pong/state", HTTP_GET,  handlePongState);
     server.on("/pong/leave", HTTP_POST, handlePongLeave);
+    server.on("/snake",        HTTP_GET,  handleSnakePage);
+    server.on("/snake/join",   HTTP_POST, handleSnakeJoin);
+    server.on("/snake/move",   HTTP_POST, handleSnakeMove);
+    server.on("/snake/state",  HTTP_GET,  handleSnakeState);
+    server.on("/snake/leave",  HTTP_POST, handleSnakeLeave);
     server.on("/crash", []() {
         String html = FPSTR(HTML_HEAD);
         html += "<div class='card'><h2>Crash Log</h2>";
@@ -2741,6 +3152,20 @@ void fetchDepartures() {
             }
             if (!isLine && gi < 0) continue;
 
+            // Resolve walkMin: cfgLines for normal, watch entry for watch group
+            int wm = 0;
+            if (isLine) {
+                for (auto& cl : cfgLines) {
+                    if (cl.rbl == rbl && cl.name == name) { wm = cl.walkMin; break; }
+                }
+            } else if (gi >= 0) {
+                for (auto& e : cfgWatchGroups[gi].entries) {
+                    if (e.source == "wl" && e.rbl == rbl && e.lineName == name && e.towards == towards) {
+                        wm = e.walkMin; break;
+                    }
+                }
+            }
+
             JsonArray deps = line["departures"]["departure"].as<JsonArray>();
             for (JsonObject dep : deps) {
                 Departure d;
@@ -2750,6 +3175,7 @@ void fetchDepartures() {
                 d.countdown = dep["departureTime"]["countdown"] | -1;
                 d.realtime  = rt;
                 d.watchIdx  = isLine ? -1 : gi;
+                d.walkMin   = wm;
                 if (d.countdown >= 0) newDeps.push_back(d);
             }
         }
@@ -2892,7 +3318,9 @@ void fetchOebbDepartures() {
         auto& allDeps = stationCache[os.stationName];
         for (auto& d : allDeps) {
             if (d.lineName == os.line && d.towards == os.towards) {
-                oebbDeps.push_back(d);
+                Departure copy = d;
+                copy.walkMin = os.walkMin;
+                oebbDeps.push_back(copy);
             }
         }
     }
@@ -2907,6 +3335,7 @@ void fetchOebbDepartures() {
                 if (d.lineName == e.lineName && d.towards == e.towards) {
                     Departure wd = d;
                     wd.watchIdx = (int)gi;
+                    wd.walkMin  = e.walkMin;
                     oebbDeps.push_back(wd);
                     break; // take only soonest matching departure per entry
                 }
@@ -3373,6 +3802,229 @@ void drawPongScene() {
     }
 }
 
+// ── Snake: physics tick ─────────────────────────────────────────────
+void snakeTick() {
+    if (!snakeMutex) return;
+    if (xSemaphoreTake(snakeMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+
+    unsigned long now = millis();
+
+    // Player timeout — slot becomes free
+    if (snake.active && now - snake.lastSeenMs > SNAKE_PLAYER_TIMEOUT_MS) {
+        snake.active = false; snake.token[0] = 0;
+    }
+
+    // No player and abandoned long enough → back to departures
+    if (!snake.active) {
+        if (snake.lastSeenMs > 0 && now - snake.lastSeenMs > SNAKE_ABANDON_TIMEOUT_MS) {
+            snake.gameRunning = false;
+            snake.gameOver    = false;
+            appMode = MODE_DEPARTURES;
+        }
+        xSemaphoreGive(snakeMutex);
+        return;
+    }
+
+    // Game-over hold; auto-restart while player is still here
+    if (snake.gameOver) {
+        if (now - snake.gameOverMs > SNAKE_GAMEOVER_HOLD_MS) {
+            snakeResetMatch();
+            snake.gameRunning = true;
+        }
+        xSemaphoreGive(snakeMutex);
+        return;
+    }
+
+    if (!snake.gameRunning) {
+        xSemaphoreGive(snakeMutex);
+        return;
+    }
+
+    if (now - snake.lastTickMs < (unsigned long)snake.tickIntervalMs) {
+        xSemaphoreGive(snakeMutex);
+        return;
+    }
+    snake.lastTickMs = now;
+
+    // Apply pending direction (already validated against reversal)
+    snake.dir = snake.pendingDir;
+
+    // Compute new head
+    int hx = snake.body[snake.length - 1].x;
+    int hy = snake.body[snake.length - 1].y;
+    switch (snake.dir) {
+        case 0: hx += 1; break;
+        case 1: hy += 1; break;
+        case 2: hx -= 1; break;
+        case 3: hy -= 1; break;
+    }
+
+    // Wall collision
+    if (hx < 0 || hx >= SNAKE_COLS || hy < 0 || hy >= SNAKE_ROWS) {
+        snake.gameOver     = true;
+        snake.gameRunning  = false;
+        snake.gameOverMs   = now;
+        snake.deathFlashMs = now;
+        if (snake.score > snake.highScore) snake.highScore = snake.score;
+        xSemaphoreGive(snakeMutex);
+        return;
+    }
+
+    // Self collision (skip the tail because it will move out this tick UNLESS we're eating)
+    bool eating = (hx == snake.food.x && hy == snake.food.y);
+    int selfStart = eating ? 0 : 1;
+    for (int i = selfStart; i < snake.length; i++) {
+        if (snake.body[i].x == hx && snake.body[i].y == hy) {
+            snake.gameOver     = true;
+            snake.gameRunning  = false;
+            snake.gameOverMs   = now;
+            snake.deathFlashMs = now;
+            if (snake.score > snake.highScore) snake.highScore = snake.score;
+            xSemaphoreGive(snakeMutex);
+            return;
+        }
+    }
+
+    if (eating) {
+        // Grow: append head
+        if (snake.length < SNAKE_MAX_LEN) {
+            snake.body[snake.length].x = (int8_t)hx;
+            snake.body[snake.length].y = (int8_t)hy;
+            snake.length++;
+        }
+        snake.score++;
+        // Speed up every 3 fahrgäste
+        if (snake.score % 3 == 0 && snake.tickIntervalMs > SNAKE_TICK_MIN_MS) {
+            snake.tickIntervalMs -= 15;
+            if (snake.tickIntervalMs < SNAKE_TICK_MIN_MS) snake.tickIntervalMs = SNAKE_TICK_MIN_MS;
+        }
+        snakePlaceFood();
+    } else {
+        // Shift: drop tail, push new head
+        for (int i = 0; i < snake.length - 1; i++) snake.body[i] = snake.body[i + 1];
+        snake.body[snake.length - 1].x = (int8_t)hx;
+        snake.body[snake.length - 1].y = (int8_t)hy;
+    }
+
+    xSemaphoreGive(snakeMutex);
+}
+
+// ── Snake: render scene ─────────────────────────────────────────────
+void drawSnakeScene() {
+    SnakeState s;
+    if (snakeMutex && xSemaphoreTake(snakeMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        s = snake;
+        xSemaphoreGive(snakeMutex);
+    } else {
+        s = snake;
+    }
+
+    unsigned long now = millis();
+    bool deathFlash = s.deathFlashMs > 0 && now - s.deathFlashMs < 500
+                      && ((now - s.deathFlashMs) / 80) % 2 == 0;
+    sprite.fillSprite(deathFlash ? AMBER_DIM : BG_COLOR);
+
+    // Header bar — score + best
+    sprite.setTextFont(1);
+    sprite.setTextSize(1);
+    sprite.setTextColor(AMBER, BG_COLOR);
+    sprite.setCursor(8, 5);
+    sprite.printf("SCORE %d", s.score);
+    String best = "BEST " + String(s.highScore);
+    int bw = sprite.textWidth(best);
+    sprite.setCursor(SCREEN_W - bw - 8, 5);
+    sprite.print(best);
+    sprite.drawFastHLine(0, SNAKE_HEADER - 2, SCREEN_W, AMBER_DIM);
+
+    // Track rails — top and bottom of grid
+    int gridY0 = SNAKE_HEADER;
+    int gridY1 = gridY0 + SNAKE_ROWS * SNAKE_CELL;
+    for (int x = 0; x < SCREEN_W; x += 8) {
+        sprite.fillRect(x, gridY1 + 1, 5, 2, AMBER_DIM);
+    }
+
+    // Faint grid dots so the play area reads as a track
+    for (int gy = 0; gy < SNAKE_ROWS; gy++) {
+        for (int gx = 0; gx < SNAKE_COLS; gx += 2) {
+            int px = gx * SNAKE_CELL + SNAKE_CELL / 2;
+            int py = gridY0 + gy * SNAKE_CELL + SNAKE_CELL / 2;
+            if (((gx + gy) & 1) == 0) sprite.drawPixel(px, py, AMBER_DIM);
+        }
+    }
+
+    // Food = Fahrgast (small body+head)
+    {
+        int cx = s.food.x * SNAKE_CELL + SNAKE_CELL / 2;
+        int cy = gridY0 + s.food.y * SNAKE_CELL + SNAKE_CELL / 2;
+        // Pulsing halo
+        bool pulse = (now / 300) % 2 == 0;
+        if (pulse) sprite.fillRect(cx - 4, cy - 4, 8, 8, AMBER_DIM);
+        // Body
+        sprite.fillRect(cx - 2, cy - 1, 5, 4, AMBER);
+        // Head
+        sprite.fillRect(cx - 1, cy - 4, 3, 3, AMBER);
+    }
+
+    // Snake body — first segment (tail) is small/dim, head is bright with headlight
+    for (int i = 0; i < s.length; i++) {
+        int x = s.body[i].x * SNAKE_CELL;
+        int y = gridY0 + s.body[i].y * SNAKE_CELL;
+        bool isHead = (i == s.length - 1);
+        bool isTail = (i == 0);
+        uint16_t col = (isHead || s.length - i <= 3) ? AMBER : AMBER_DIM;
+
+        // Waggon body
+        int pad = isTail ? 2 : 1;
+        sprite.fillRect(x + pad, y + pad, SNAKE_CELL - 2 * pad, SNAKE_CELL - 2 * pad, BG_COLOR);
+        sprite.drawRect(x + pad, y + pad, SNAKE_CELL - 2 * pad, SNAKE_CELL - 2 * pad, col);
+
+        // Window in the middle
+        if (!isTail) sprite.fillRect(x + 4, y + 4, 2, 2, col);
+
+        // Headlight on the head
+        if (isHead) {
+            switch (s.dir) {
+                case 0: sprite.fillRect(x + SNAKE_CELL - 2, y + SNAKE_CELL/2 - 1, 2, 3, AMBER); break;
+                case 1: sprite.fillRect(x + SNAKE_CELL/2 - 1, y + SNAKE_CELL - 2, 3, 2, AMBER); break;
+                case 2: sprite.fillRect(x,                   y + SNAKE_CELL/2 - 1, 2, 3, AMBER); break;
+                case 3: sprite.fillRect(x + SNAKE_CELL/2 - 1, y,                   3, 2, AMBER); break;
+            }
+        }
+    }
+
+    // Overlays
+    if (!s.active) {
+        sprite.setTextSize(2);
+        const char* msg = "Warte auf Spieler...";
+        int tw = sprite.textWidth(msg);
+        drawGlowText(sprite, (SCREEN_W - tw) / 2, SCREEN_H / 2 - 12, msg);
+        sprite.setTextSize(1);
+        const char* hint = "linetracker.local/snake";
+        int hw = sprite.textWidth(hint);
+        sprite.setTextColor(AMBER_DIM, BG_COLOR);
+        sprite.setCursor((SCREEN_W - hw) / 2, SCREEN_H / 2 + 12);
+        sprite.print(hint);
+        return;
+    }
+
+    if (s.gameOver) {
+        // Dim overlay + Endstation banner
+        sprite.fillRect(0, gridY0 + 20, SCREEN_W, 70, BG_COLOR);
+        sprite.drawRect(0, gridY0 + 20, SCREEN_W, 70, AMBER);
+        sprite.drawRect(1, gridY0 + 21, SCREEN_W - 2, 68, AMBER_DIM);
+        sprite.setTextSize(3);
+        const char* line1 = "ENDSTATION";
+        int tw = sprite.textWidth(line1);
+        drawGlowText(sprite, (SCREEN_W - tw) / 2, gridY0 + 30, line1);
+        sprite.setTextSize(1);
+        String sub = "Score " + String(s.score) + " - startet neu";
+        int sw = sprite.textWidth(sub);
+        sprite.setTextColor(AMBER_DIM, BG_COLOR);
+        sprite.setCursor((SCREEN_W - sw) / 2, gridY0 + 70);
+        sprite.print(sub);
+    }
+}
+
 void drawDisplay() {
     sprite.createSprite(SCREEN_W, SCREEN_H);
     sprite.fillSprite(BG_COLOR);
@@ -3381,6 +4033,14 @@ void drawDisplay() {
     // ── Pong takeover ──
     if (appMode == MODE_PONG) {
         drawPongScene();
+        sprite.pushSprite(0, 0);
+        sprite.deleteSprite();
+        return;
+    }
+
+    // ── Snake takeover ──
+    if (appMode == MODE_SNAKE) {
+        drawSnakeScene();
         sprite.pushSprite(0, 0);
         sprite.deleteSprite();
         return;
@@ -3580,13 +4240,26 @@ void drawDisplay() {
             if (lw > maxLeftW) maxLeftW = lw;
         }
 
+        // Time-to-leave: a slot is in "JETZT" mode when walkMin > 0 and the
+        // remaining countdown has fallen to/below the walk time.
+        const int JETZT_SZ = 3;
+        bool anyJetzt = false;
         sprite.setTextSize(CD_SZ);
         int maxRightW = 0;
         for (int i = 0; i < rows; i++) {
-            if (displaySlots[pageOffset + i].countdown > 0) {
-                int rw = sprite.textWidth(String(displaySlots[pageOffset + i].countdown));
+            const Departure& sd = displaySlots[pageOffset + i];
+            bool jetzt = sd.walkMin > 0 && sd.countdown > 0 && sd.countdown <= sd.walkMin;
+            if (jetzt) anyJetzt = true;
+            if (sd.countdown > 0 && !jetzt) {
+                int rw = sprite.textWidth(String(sd.countdown));
                 if (rw > maxRightW) maxRightW = rw;
             }
+        }
+        if (anyJetzt) {
+            sprite.setTextSize(JETZT_SZ);
+            int jw = sprite.textWidth("JETZT");
+            if (jw > maxRightW) maxRightW = jw;
+            sprite.setTextSize(CD_SZ);
         }
         int arrSz = 10;
         if (maxRightW < arrSz * 2 + 2) maxRightW = arrSz * 2 + 2;
@@ -3692,7 +4365,8 @@ void drawDisplay() {
                 clip.deleteSprite();
             }
 
-            // ── Countdown or arriving blink (right) ──
+            // ── Countdown / JETZT / arriving blink (right) ──
+            bool jetztMode = d.walkMin > 0 && d.countdown > 0 && d.countdown <= d.walkMin;
             sprite.setTextSize(CD_SZ);
             if (d.countdown == 0) {
                 bool phase = (millis() / 1000) % 2 == 0;
@@ -3709,6 +4383,23 @@ void drawDisplay() {
                     sprite.fillRect(ax,            ay,            sz, sz, AMBER);
                     sprite.fillRect(ax + sz + gap, ay + sz + gap, sz, sz, AMBER);
                 }
+            } else if (jetztMode) {
+                // Blink "JETZT" at ~2 Hz; full glow when on, dim halo when off
+                bool on = (millis() / 500) % 2 == 0;
+                sprite.setTextSize(JETZT_SZ);
+                int jH = 7 * JETZT_SZ;
+                int jw = sprite.textWidth("JETZT");
+                int jx = SCREEN_W - PX_MARGIN - jw;
+                int jy = centerY - jH / 2;
+                if (on) {
+                    drawGlowText(sprite, jx, jy, "JETZT");
+                } else {
+                    sprite.setTextColor(AMBER_DIM, BG_COLOR);
+                    sprite.setCursor(jx, jy);
+                    sprite.print("JETZT");
+                }
+                sprite.setTextSize(CD_SZ);
+                sprite.setTextColor(AMBER, BG_COLOR);
             } else {
                 // Main countdown
                 String cdStr = String(d.countdown);
@@ -3908,7 +4599,8 @@ void dataTask(void* param) {
 void displayTask(void* param) {
     unsigned long lastNightCheck = 0;
     for (;;) {
-        if (appMode == MODE_PONG) pongTick();
+        if (appMode == MODE_PONG)  pongTick();
+        if (appMode == MODE_SNAKE) snakeTick();
         drawDisplay();
         if (millis() - lastNightCheck > 10000) {
             applyNightMode();
@@ -4055,8 +4747,9 @@ void setup() {
     }
 
     // Start display task immediately so setup screen with IP shows
-    dataMutex = xSemaphoreCreateMutex();
-    pongMutex = xSemaphoreCreateMutex();
+    dataMutex  = xSemaphoreCreateMutex();
+    pongMutex  = xSemaphoreCreateMutex();
+    snakeMutex = xSemaphoreCreateMutex();
     xTaskCreatePinnedToCore(displayTask, "display", 8192,  NULL, 1, NULL, 1);
 
     // NTP config (sync happens in background, no blocking wait)
