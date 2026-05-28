@@ -98,7 +98,7 @@ void saveCrashInfo() {
 }
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.5.0"
+#define FW_VERSION "1.5.1"
 #define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
@@ -343,7 +343,7 @@ struct ConfigLine {
     String name;
     String towards;
     String type;
-    int    walkMin = 0;  // minutes to walk to stop (0 = off, otherwise show JETZT when countdown<=walkMin)
+    int    walkMin = 0;  // minutes to walk to stop (0 = off; when countdown<=walkMin the slot blinks "leave now")
 };
 static std::vector<ConfigLine> cfgLines;
 
@@ -1269,7 +1269,7 @@ void handleRoot() {
                 html += "<div class='line-item'>";
                 html += "<span class='" + badgeClassForType(cl.type) + "'>" + cl.name + "</span>";
                 html += "<div class='dir'>" + cl.towards + "</div>";
-                html += "<label class='walk' title='Gehweg zum Stop in Minuten \\u2014 wenn Countdown \\u2264 dieser Wert, zeigt das Display JETZT'><span class='lbl'>Gehw</span>";
+                html += "<label class='walk' title='Gehweg zum Stop in Minuten \\u2014 wenn Countdown \\u2264 dieser Wert, blinkt die Abfahrt (Zeit zum Losgehen)'><span class='lbl'>Gehw</span>";
                 html += "<input type='number' min='0' max='30' value='" + String(cl.walkMin) +
                         "' class='" + String(cl.walkMin > 0 ? "on" : "") +
                         "' data-kind='wl' data-idx='" + String(i) + "' onchange='setWalk(this)'></label>";
@@ -1888,7 +1888,12 @@ void handleWatchGroupEdit() {
         auto& e = g.entries[ei];
         String entryLabel = e.lineName + " &rarr; " + e.towards;
         if (e.source == "oebb") entryLabel += " (" + e.oebbStation + ")";
-        html += "<label class='check-label'><input type='checkbox' name='keep' value='" + String(ei) + "' checked> " + entryLabel + "</label>";
+        html += "<div style='display:flex;align-items:center;gap:8px;margin:6px 0'>";
+        html += "<label class='check-label' style='flex:1'><input type='checkbox' name='keep' value='" + String(ei) + "' checked> " + entryLabel + "</label>";
+        html += "<label class='walk' title='Gehweg in Minuten \\u2014 0 = aus'><span class='lbl'>Gehw</span>";
+        html += "<input type='number' min='0' max='30' name='walk_" + String(ei) + "' value='" + String(e.walkMin) +
+                "' class='" + String(e.walkMin > 0 ? "on" : "") + "'></label>";
+        html += "</div>";
     }
     html += "<button type='submit'>Speichern</button>";
     html += "</form>";
@@ -1912,6 +1917,15 @@ void handleWatchGroupUpdate() {
         if (server.argName(i) == "keep") {
             int ei = server.arg(i).toInt();
             if (ei >= 0 && ei < (int)g.entries.size()) keep[ei] = true;
+        }
+    }
+    for (size_t ei = 0; ei < g.entries.size(); ei++) {
+        String wn = "walk_" + String(ei);
+        if (server.hasArg(wn)) {
+            int wmv = server.arg(wn).toInt();
+            if (wmv < 0)  wmv = 0;
+            if (wmv > 30) wmv = 30;
+            g.entries[ei].walkMin = wmv;
         }
     }
     std::vector<WatchGroupEntry> newEntries;
@@ -3002,11 +3016,33 @@ void setupWiFi() {
         wm.startConfigPortal("LineTracker");
         // After portal, continue — dataTask handles reconnect
     } else if (!SPIFFS.exists(WIFI_CONFIGURED_FLAG)) {
-        // No wifi_ok flag → never been set up → first-time setup
-        showWifiSetupScreen("Ersteinrichtung");
-        wm.setSaveConnectTimeout(30);
-        wm.setConfigPortalTimeout(0); // no timeout for first setup
-        wm.startConfigPortal("LineTracker");
+        // /wifi_ok missing. Could be a genuine first setup, OR the SPIFFS flag was
+        // lost (e.g. filesystem wiped on reflash) while WiFi credentials still live
+        // in NVS. If credentials exist, connect directly instead of forcing the
+        // setup portal — and recreate the flag so we don't show setup every boot.
+        if (wm.getWiFiIsSaved()) {
+            WiFi.begin();
+            unsigned long start = millis();
+            while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+                delay(200);
+            }
+            if (WiFi.status() == WL_CONNECTED) {
+                File f = SPIFFS.open(WIFI_CONFIGURED_FLAG, "w");
+                if (f) { f.print("1"); f.close(); }
+            } else {
+                // Saved credentials no longer work → fall back to setup portal
+                showWifiSetupScreen("Ersteinrichtung");
+                wm.setSaveConnectTimeout(30);
+                wm.setConfigPortalTimeout(0);
+                wm.startConfigPortal("LineTracker");
+            }
+        } else {
+            // Truly never configured → first-time setup
+            showWifiSetupScreen("Ersteinrichtung");
+            wm.setSaveConnectTimeout(30);
+            wm.setConfigPortalTimeout(0); // no timeout for first setup
+            wm.startConfigPortal("LineTracker");
+        }
     } else {
         // Already configured — try to connect, dataTask handles if WiFi is down
         WiFi.begin();
@@ -4240,26 +4276,19 @@ void drawDisplay() {
             if (lw > maxLeftW) maxLeftW = lw;
         }
 
-        // Time-to-leave: a slot is in "JETZT" mode when walkMin > 0 and the
-        // remaining countdown has fallen to/below the walk time.
-        const int JETZT_SZ = 3;
-        bool anyJetzt = false;
+        // Time-to-leave: a slot is in "leave now" mode when walkMin > 0 and the
+        // remaining countdown has fallen to/below the walk time. It uses the same
+        // blinking-squares animation as an arriving (countdown==0) slot, so it
+        // needs no extra width beyond the arriving-square floor below.
         sprite.setTextSize(CD_SZ);
         int maxRightW = 0;
         for (int i = 0; i < rows; i++) {
             const Departure& sd = displaySlots[pageOffset + i];
             bool jetzt = sd.walkMin > 0 && sd.countdown > 0 && sd.countdown <= sd.walkMin;
-            if (jetzt) anyJetzt = true;
             if (sd.countdown > 0 && !jetzt) {
                 int rw = sprite.textWidth(String(sd.countdown));
                 if (rw > maxRightW) maxRightW = rw;
             }
-        }
-        if (anyJetzt) {
-            sprite.setTextSize(JETZT_SZ);
-            int jw = sprite.textWidth("JETZT");
-            if (jw > maxRightW) maxRightW = jw;
-            sprite.setTextSize(CD_SZ);
         }
         int arrSz = 10;
         if (maxRightW < arrSz * 2 + 2) maxRightW = arrSz * 2 + 2;
@@ -4365,10 +4394,12 @@ void drawDisplay() {
                 clip.deleteSprite();
             }
 
-            // ── Countdown / JETZT / arriving blink (right) ──
+            // ── Countdown / arriving-or-leave-now blink (right) ──
+            // jetztMode (walkMin reached) shows the same blinking squares as an
+            // arriving slot — "leave now" and "arriving" share one indicator.
             bool jetztMode = d.walkMin > 0 && d.countdown > 0 && d.countdown <= d.walkMin;
             sprite.setTextSize(CD_SZ);
-            if (d.countdown == 0) {
+            if (d.countdown == 0 || jetztMode) {
                 bool phase = (millis() / 1000) % 2 == 0;
                 int sz  = arrSz;
                 int gap = 2;
@@ -4383,23 +4414,6 @@ void drawDisplay() {
                     sprite.fillRect(ax,            ay,            sz, sz, AMBER);
                     sprite.fillRect(ax + sz + gap, ay + sz + gap, sz, sz, AMBER);
                 }
-            } else if (jetztMode) {
-                // Blink "JETZT" at ~2 Hz; full glow when on, dim halo when off
-                bool on = (millis() / 500) % 2 == 0;
-                sprite.setTextSize(JETZT_SZ);
-                int jH = 7 * JETZT_SZ;
-                int jw = sprite.textWidth("JETZT");
-                int jx = SCREEN_W - PX_MARGIN - jw;
-                int jy = centerY - jH / 2;
-                if (on) {
-                    drawGlowText(sprite, jx, jy, "JETZT");
-                } else {
-                    sprite.setTextColor(AMBER_DIM, BG_COLOR);
-                    sprite.setCursor(jx, jy);
-                    sprite.print("JETZT");
-                }
-                sprite.setTextSize(CD_SZ);
-                sprite.setTextColor(AMBER, BG_COLOR);
             } else {
                 // Main countdown
                 String cdStr = String(d.countdown);
