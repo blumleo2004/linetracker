@@ -98,7 +98,7 @@ void saveCrashInfo() {
 }
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.6.0"
+#define FW_VERSION "1.6.1"
 #define OTA_VERSION_URL      "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 #define OTA_VERSION_URL_BETA "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version-beta.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
@@ -534,6 +534,7 @@ struct Departure {
     int    walkMin  = 0;  // resolved walk-to-stop minutes (0 = off)
 };
 
+static const int MAX_ROWS = 3;                // departure rows per display page
 static std::vector<Departure> departures;     // all departures (raw)
 static std::vector<Departure> displaySlots;   // one per line+direction (smart grouped)
 static std::vector<String>    disruptions;    // active WL disruption titles
@@ -1106,6 +1107,10 @@ button.add{background:#2e7d32;color:#fff}
 .rm{background:transparent;border:1px solid rgba(229,57,53,.5);color:#e53935;width:34px;min-width:34px;height:34px;padding:0;font-size:14px;margin:0;border-radius:4px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .15s,color .15s,border-color .15s}
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(245,196,0,.25);border-top-color:#f5c400;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px}
 @keyframes spin{to{transform:rotate(360deg)}}
+.live-page{margin-bottom:12px}
+.live-page:last-child{margin-bottom:0}
+.live-page-label{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:#686868;margin:2px 0 4px;border-bottom:1px solid #2a2a2a;padding-bottom:3px}
+.live-clock{font-family:'Courier New',Courier,monospace;font-weight:700;color:#f5c400;font-size:26px;text-align:center;padding:10px 0}
 .live-row{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #1c1c1c}
 .live-row:last-child{border-bottom:0}
 .live-line{font-family:'Courier New',Courier,monospace;font-weight:700;color:#f5c400;min-width:44px;flex-shrink:0}
@@ -1113,7 +1118,8 @@ button.add{background:#2e7d32;color:#fff}
 .live-cd{font-family:'Courier New',Courier,monospace;font-weight:700;color:#f5c400;min-width:38px;text-align:right;flex-shrink:0}
 .live-cd.now{color:#ff5252}
 .reorder{display:flex;flex-direction:column;gap:2px;flex-shrink:0;margin-right:2px}
-.ord{width:26px;height:16px;min-width:26px;padding:0;margin:0;line-height:1;font-size:9px;background:#181818;border:1px solid rgba(245,196,0,.2);color:#f5c400;border-radius:3px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.ord{width:38px;height:21px;min-width:38px;padding:0;margin:0;line-height:1;font-size:12px;background:#181818;border:1px solid rgba(245,196,0,.35);color:#f5c400;border-radius:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+.ord:active:not(:disabled){background:#332900}
 .ord:disabled{opacity:.3;cursor:default}
 .rm:hover{background:#e53935;color:#fff;border-color:#e53935}
 .btn-secondary{background:#252525;color:#ccc;font-weight:500;border:1px solid rgba(255,255,255,.1)}
@@ -1322,13 +1328,11 @@ void handleRoot() {
                         "' class='" + String(cl.walkMin > 0 ? "on" : "") +
                         "' data-kind='wl' data-idx='" + String(i) + "' onchange='setWalk(this)'></label>";
                 {
-                    String dis = cfgSortByTime ? " disabled" : "";
-                    String t = cfgSortByTime ? " title='Reihenfolge wird von \"nach Zeit sortieren\" bestimmt'" : "";
-                    html += "<div class='reorder'" + t + ">";
+                    html += "<div class='reorder'>";
                     html += "<button type='button' class='ord' onclick='moveLine(" + String(i) + ",-1)'" +
-                            (i == 0 ? " disabled" : dis) + ">&#9650;</button>";
+                            (i == 0 ? " disabled" : "") + ">&#9650;</button>";
                     html += "<button type='button' class='ord' onclick='moveLine(" + String(i) + ",1)'" +
-                            (i == (size_t)(n - 1) ? " disabled" : dis) + ">&#9660;</button>";
+                            (i == (size_t)(n - 1) ? " disabled" : "") + ">&#9660;</button>";
                     html += "</div>";
                 }
                 html += "<form action='/remove' method='POST' style='margin:0'>";
@@ -1414,15 +1418,27 @@ void handleRoot() {
             "function moveLine(i,d){var b=new URLSearchParams({idx:i,dir:d});"
             "fetch('/move-line',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b.toString()})"
             ".then(function(r){if(r.ok)location.reload()})}"
-            "function renderLive(d){var e=document.getElementById('live');if(!e)return;"
-            "if(!d.slots||!d.slots.length){e.innerHTML=\"<p class='status'>Keine Abfahrten</p>\";return;}"
-            "e.innerHTML='';d.slots.forEach(function(s){"
-            "var row=document.createElement('div');row.className='live-row';"
+            "function liveRow(s){var row=document.createElement('div');row.className='live-row';"
             "var ln=document.createElement('span');ln.className='live-line';ln.textContent=s.line;"
             "var to=document.createElement('span');to.className='live-to';to.textContent=s.to;"
             "var cd=document.createElement('span');cd.className='live-cd';"
             "if(s.cd===0){cd.textContent='\\u25A0';}else if(s.walk>0&&s.cd<=s.walk){cd.textContent='jetzt';cd.classList.add('now');}else{cd.textContent=s.cd+\"'\";}"
-            "row.appendChild(ln);row.appendChild(to);row.appendChild(cd);e.appendChild(row);});}"
+            "row.appendChild(ln);row.appendChild(to);row.appendChild(cd);return row;}"
+            "function liveLabel(t){var l=document.createElement('div');l.className='live-page-label';l.textContent=t;return l;}"
+            "function renderLive(d){var e=document.getElementById('live');if(!e)return;"
+            "var slots=d.slots||[],rows=d.rows||3;"
+            "if(!slots.length&&!d.clock){e.innerHTML=\"<p class='status'>Keine Abfahrten</p>\";return;}"
+            "e.innerHTML='';"
+            "var nPages=Math.ceil(slots.length/rows),total=nPages+(d.clock?1:0),labeled=total>1;"
+            "for(var p=0;p<nPages;p++){var pg=document.createElement('div');pg.className='live-page';"
+            "if(labeled)pg.appendChild(liveLabel('Seite '+(p+1)));"
+            "for(var k=p*rows;k<Math.min((p+1)*rows,slots.length);k++)pg.appendChild(liveRow(slots[k]));"
+            "e.appendChild(pg);}"
+            "if(d.clock){var cp=document.createElement('div');cp.className='live-page';"
+            "if(labeled)cp.appendChild(liveLabel('Uhr'));"
+            "var cr=document.createElement('div');cr.className='live-clock';var nw=new Date();"
+            "cr.textContent=('0'+nw.getHours()).slice(-2)+':'+('0'+nw.getMinutes()).slice(-2);"
+            "cp.appendChild(cr);e.appendChild(cp);}}"
             "function pollLive(){fetch('/api/now').then(function(r){return r.json()}).then(renderLive).catch(function(){})}"
             "if(document.getElementById('live')){pollLive();setInterval(pollLive,5000);}"
             "var sf=document.getElementById('searchForm');"
@@ -1700,6 +1716,9 @@ void handleMoveLine() {
         return;
     }
     std::swap(cfgLines[idx], cfgLines[j]);
+    // Manual reordering implies manual order mode — otherwise time-sort would
+    // override it and the arrows would appear to do nothing.
+    cfgSortByTime = false;
     saveConfig();
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     departures.clear();
@@ -1721,7 +1740,9 @@ void handleApiNow() {
         o["cd"]   = d.countdown;
         o["walk"] = d.walkMin;
     }
-    doc["err"] = fetchError;
+    doc["err"]   = fetchError;
+    doc["rows"]  = MAX_ROWS;        // departures per display page
+    doc["clock"] = cfgShowClock;    // whether a clock page is in the rotation
     xSemaphoreGive(dataMutex);
     String out;
     serializeJson(doc, out);
@@ -3533,7 +3554,6 @@ String sanitize(String s) {
 // ── Drawing: Fahrgastinformationssystem (dot-matrix amber LED style) ──
 static const int SCREEN_W  = 320;
 static const int SCREEN_H  = 170;
-static const int MAX_ROWS   = 3;
 static const int PX_MARGIN  = 6;
 static const int SEP_H      = 3;
 static const int SCROLL_PX  = 2;
