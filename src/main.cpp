@@ -98,8 +98,9 @@ void saveCrashInfo() {
 }
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.5.1"
-#define OTA_VERSION_URL "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
+#define FW_VERSION "1.5.2"
+#define OTA_VERSION_URL      "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
+#define OTA_VERSION_URL_BETA "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version-beta.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
 
 // ── Display ──────────────────────────────────────────────────────────
@@ -336,6 +337,7 @@ static int  cfgNightBright    = 20;    // backlight during night mode
 static bool   cfgShowNext        = false; // show next departure below main countdown
 static bool   cfgShowDisruptions = false; // show WL disruption ticker at bottom
 static bool   cfgSortByTime      = true;  // sort display slots by countdown
+static bool   cfgBetaChannel     = false; // pull OTA updates from the beta channel (version-beta.json)
 static String cfgHostname        = "";    // mDNS hostname, generated from MAC on first boot
 
 struct ConfigLine {
@@ -451,6 +453,7 @@ bool loadConfig() {
     cfgShowNext        = doc["show_next"]         | false;
     cfgShowDisruptions = doc["show_disruptions"]  | false;
     cfgSortByTime      = doc["sort_by_time"]      | true;
+    cfgBetaChannel     = doc["beta_channel"]      | false;
     cfgHostname        = doc["hostname"]          | "";
     if (cfgRotateSec   < 2)   cfgRotateSec   = 2;
     if (cfgRotateSec   > 60)  cfgRotateSec   = 60;
@@ -508,6 +511,7 @@ void saveConfig() {
     doc["show_next"]        = cfgShowNext;
     doc["show_disruptions"] = cfgShowDisruptions;
     doc["sort_by_time"]     = cfgSortByTime;
+    doc["beta_channel"]     = cfgBetaChannel;
     doc["hostname"]         = cfgHostname;
     serializeJson(doc, f);
     f.close();
@@ -1195,6 +1199,9 @@ void handleSettingsPage() {
     html += "<label class='check-label'><input type='checkbox' name='sort_by_time' value='1'";
     if (cfgSortByTime) html += " checked";
     html += ">Display nach Zeit sortieren</label>";
+    html += "<label class='check-label'><input type='checkbox' name='beta_channel' value='1'";
+    if (cfgBetaChannel) html += " checked";
+    html += ">Beta-Updates (Testkanal)</label>";
     html += "</div>";
 
     html += "<button type='submit' style='margin-top:16px'>Speichern</button>";
@@ -2088,6 +2095,7 @@ void handleSettings() {
     cfgShowNext        = server.hasArg("show_next");
     cfgShowDisruptions = server.hasArg("show_disruptions");
     cfgSortByTime      = server.hasArg("sort_by_time");
+    cfgBetaChannel     = server.hasArg("beta_channel");
 
     // Apply brightness immediately
     if (cfgNightFrom >= 0 && cfgNightTo >= 0) {
@@ -2129,7 +2137,7 @@ bool checkOtaUpdate() {
     WiFiClientSecure client;
     client.setInsecure();
     HTTPClient http;
-    http.begin(client, OTA_VERSION_URL);
+    http.begin(client, cfgBetaChannel ? OTA_VERSION_URL_BETA : OTA_VERSION_URL);
     http.setTimeout(10000);
     int code = http.GET();
     if (code != 200) { http.end(); return false; }
@@ -2187,7 +2195,7 @@ String checkRemoteVersion() {
     WiFiClientSecure client;
     client.setInsecure();
     HTTPClient http;
-    http.begin(client, OTA_VERSION_URL);
+    http.begin(client, cfgBetaChannel ? OTA_VERSION_URL_BETA : OTA_VERSION_URL);
     http.setTimeout(10000);
     int code = http.GET();
     if (code != 200) {
