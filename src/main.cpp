@@ -98,7 +98,7 @@ void saveCrashInfo() {
 }
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.5.2"
+#define FW_VERSION "1.6.0"
 #define OTA_VERSION_URL      "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 #define OTA_VERSION_URL_BETA "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version-beta.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
@@ -336,6 +336,8 @@ static int  cfgNightTo        = -1;    // night mode end hour (0-23)
 static int  cfgNightBright    = 20;    // backlight during night mode
 static bool   cfgShowNext        = false; // show next departure below main countdown
 static bool   cfgShowDisruptions = false; // show WL disruption ticker at bottom
+static bool   cfgShowClock        = false; // show a clock as its own page in the rotation
+static bool   cfgLineColors       = false; // tint U-Bahn lines in official colors (default off = amber FIS)
 static bool   cfgSortByTime      = true;  // sort display slots by countdown
 static bool   cfgBetaChannel     = false; // pull OTA updates from the beta channel (version-beta.json)
 static String cfgHostname        = "";    // mDNS hostname, generated from MAC on first boot
@@ -452,6 +454,8 @@ bool loadConfig() {
     cfgNightBright     = doc["night_bright"]      | 20;
     cfgShowNext        = doc["show_next"]         | false;
     cfgShowDisruptions = doc["show_disruptions"]  | false;
+    cfgShowClock       = doc["show_clock"]        | false;
+    cfgLineColors      = doc["line_colors"]       | false;
     cfgSortByTime      = doc["sort_by_time"]      | true;
     cfgBetaChannel     = doc["beta_channel"]      | false;
     cfgHostname        = doc["hostname"]          | "";
@@ -510,6 +514,8 @@ void saveConfig() {
     doc["night_bright"]     = cfgNightBright;
     doc["show_next"]        = cfgShowNext;
     doc["show_disruptions"] = cfgShowDisruptions;
+    doc["show_clock"]       = cfgShowClock;
+    doc["line_colors"]      = cfgLineColors;
     doc["sort_by_time"]     = cfgSortByTime;
     doc["beta_channel"]     = cfgBetaChannel;
     doc["hostname"]         = cfgHostname;
@@ -1098,6 +1104,17 @@ button.add{background:#2e7d32;color:#fff}
 .walk input[type=number].on{border-color:rgba(245,196,0,.6);background:#221b00}
 .walk .lbl{font-size:10px;line-height:1;letter-spacing:.5px;text-transform:uppercase}
 .rm{background:transparent;border:1px solid rgba(229,57,53,.5);color:#e53935;width:34px;min-width:34px;height:34px;padding:0;font-size:14px;margin:0;border-radius:4px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .15s,color .15s,border-color .15s}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(245,196,0,.25);border-top-color:#f5c400;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.live-row{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #1c1c1c}
+.live-row:last-child{border-bottom:0}
+.live-line{font-family:'Courier New',Courier,monospace;font-weight:700;color:#f5c400;min-width:44px;flex-shrink:0}
+.live-to{flex:1;color:#cfcfcf;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.live-cd{font-family:'Courier New',Courier,monospace;font-weight:700;color:#f5c400;min-width:38px;text-align:right;flex-shrink:0}
+.live-cd.now{color:#ff5252}
+.reorder{display:flex;flex-direction:column;gap:2px;flex-shrink:0;margin-right:2px}
+.ord{width:26px;height:16px;min-width:26px;padding:0;margin:0;line-height:1;font-size:9px;background:#181818;border:1px solid rgba(245,196,0,.2);color:#f5c400;border-radius:3px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.ord:disabled{opacity:.3;cursor:default}
 .rm:hover{background:#e53935;color:#fff;border-color:#e53935}
 .btn-secondary{background:#252525;color:#ccc;font-weight:500;border:1px solid rgba(255,255,255,.1)}
 .btn-secondary:hover{background:#2e2e2e;opacity:1;transform:none}
@@ -1152,6 +1169,19 @@ String badgeClassForType(const String& type) {
     return "badge unknown";
 }
 
+// Official Vienna U-Bahn colors as an inline-style override for a badge.
+// Only active when cfgLineColors is on; returns "" otherwise (badge keeps its
+// default class color). Trams/buses already have their own badge colors.
+String badgeColorStyle(const String& name, const String& type) {
+    if (!cfgLineColors || type != "ptMetro") return "";
+    if (name == "U1") return " style='background:#E20613;color:#fff'";
+    if (name == "U2") return " style='background:#9C4F9F;color:#fff'";
+    if (name == "U3") return " style='background:#EF7C00;color:#0d0d0d'";
+    if (name == "U4") return " style='background:#00A64F;color:#fff'";
+    if (name == "U6") return " style='background:#9C6B30;color:#fff'";
+    return "";
+}
+
 void sendHtml(const String& html) {
     server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     server.send(200, "text/html; charset=utf-8", html);
@@ -1196,6 +1226,12 @@ void handleSettingsPage() {
     html += "<label class='check-label'><input type='checkbox' name='show_disruptions' value='1'";
     if (cfgShowDisruptions) html += " checked";
     html += ">St&ouml;rungsticker anzeigen</label>";
+    html += "<label class='check-label'><input type='checkbox' name='show_clock' value='1'";
+    if (cfgShowClock) html += " checked";
+    html += ">Uhr als eigene Seite anzeigen</label>";
+    html += "<label class='check-label'><input type='checkbox' name='line_colors' value='1'";
+    if (cfgLineColors) html += " checked";
+    html += ">U-Bahn-Linienfarben</label>";
     html += "<label class='check-label'><input type='checkbox' name='sort_by_time' value='1'";
     if (cfgSortByTime) html += " checked";
     html += ">Display nach Zeit sortieren</label>";
@@ -1254,14 +1290,19 @@ void handleRoot() {
                 "history.replaceState(null,'','/');</script>";
     }
 
+    // ── Live preview card (mirrors the display, read-only) ────────────────
+    html += "<div class='card'><h2 style='margin-bottom:10px'>Aktuell am Display</h2>";
+    html += "<div id='live'><p class='status'>Lade&hellip;</p></div></div>";
+
     // ── Search card ──────────────────────────────────────────────────────
     html += "<div class='card'>";
-    html += "<form action='/search' method='GET' class='search-row'>";
+    html += "<form id='searchForm' action='/search' method='GET' class='search-row'>";
     html += "<input type='text' name='q' placeholder='Station suchen...' autofocus>";
     html += "<button type='submit' style='width:auto;margin:0;padding:0 16px'>&#8594;</button>";
     html += "</form>";
     html += "<a href='/browse'><button class='btn-secondary' style='margin-top:8px;font-size:12px;padding:10px'>Alle Stationen</button></a>";
     html += "</div>";
+    html += "<div id='searchResults'></div>";
 
     // ── WL Active Lines ──────────────────────────────────────────────────
     {
@@ -1274,12 +1315,22 @@ void handleRoot() {
             for (size_t i = 0; i < cfgLines.size(); i++) {
                 auto& cl = cfgLines[i];
                 html += "<div class='line-item'>";
-                html += "<span class='" + badgeClassForType(cl.type) + "'>" + cl.name + "</span>";
+                html += "<span class='" + badgeClassForType(cl.type) + "'" + badgeColorStyle(cl.name, cl.type) + ">" + cl.name + "</span>";
                 html += "<div class='dir'>" + cl.towards + "</div>";
                 html += "<label class='walk' title='Gehweg zum Stop in Minuten \\u2014 wenn Countdown \\u2264 dieser Wert, blinkt die Abfahrt (Zeit zum Losgehen)'><span class='lbl'>Gehw</span>";
                 html += "<input type='number' min='0' max='30' value='" + String(cl.walkMin) +
                         "' class='" + String(cl.walkMin > 0 ? "on" : "") +
                         "' data-kind='wl' data-idx='" + String(i) + "' onchange='setWalk(this)'></label>";
+                {
+                    String dis = cfgSortByTime ? " disabled" : "";
+                    String t = cfgSortByTime ? " title='Reihenfolge wird von \"nach Zeit sortieren\" bestimmt'" : "";
+                    html += "<div class='reorder'" + t + ">";
+                    html += "<button type='button' class='ord' onclick='moveLine(" + String(i) + ",-1)'" +
+                            (i == 0 ? " disabled" : dis) + ">&#9650;</button>";
+                    html += "<button type='button' class='ord' onclick='moveLine(" + String(i) + ",1)'" +
+                            (i == (size_t)(n - 1) ? " disabled" : dis) + ">&#9660;</button>";
+                    html += "</div>";
+                }
                 html += "<form action='/remove' method='POST' style='margin:0'>";
                 html += "<input type='hidden' name='idx' value='" + String(i) + "'>";
                 html += "<button class='rm' type='button' onclick='confirmRm(this)'>&#x2715;</button></form>";
@@ -1360,6 +1411,27 @@ void handleRoot() {
             ".then(function(r){if(!r.ok)el.style.borderColor='#e53935';else{el.style.borderColor='';"
             "var t=document.createElement('div');t.className='toast';t.textContent=m>0?('Gehweg '+m+' min'):'Gehweg aus';"
             "document.body.appendChild(t);setTimeout(function(){t.remove()},2500);}}).catch(function(){el.style.borderColor='#e53935'})}"
+            "function moveLine(i,d){var b=new URLSearchParams({idx:i,dir:d});"
+            "fetch('/move-line',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b.toString()})"
+            ".then(function(r){if(r.ok)location.reload()})}"
+            "function renderLive(d){var e=document.getElementById('live');if(!e)return;"
+            "if(!d.slots||!d.slots.length){e.innerHTML=\"<p class='status'>Keine Abfahrten</p>\";return;}"
+            "e.innerHTML='';d.slots.forEach(function(s){"
+            "var row=document.createElement('div');row.className='live-row';"
+            "var ln=document.createElement('span');ln.className='live-line';ln.textContent=s.line;"
+            "var to=document.createElement('span');to.className='live-to';to.textContent=s.to;"
+            "var cd=document.createElement('span');cd.className='live-cd';"
+            "if(s.cd===0){cd.textContent='\\u25A0';}else if(s.walk>0&&s.cd<=s.walk){cd.textContent='jetzt';cd.classList.add('now');}else{cd.textContent=s.cd+\"'\";}"
+            "row.appendChild(ln);row.appendChild(to);row.appendChild(cd);e.appendChild(row);});}"
+            "function pollLive(){fetch('/api/now').then(function(r){return r.json()}).then(renderLive).catch(function(){})}"
+            "if(document.getElementById('live')){pollLive();setInterval(pollLive,5000);}"
+            "var sf=document.getElementById('searchForm');"
+            "if(sf){sf.addEventListener('submit',function(ev){ev.preventDefault();"
+            "var q=sf.q.value.trim();var rc=document.getElementById('searchResults');"
+            "if(q.length<2){rc.innerHTML=\"<div class='card'><p class='status'>Mindestens 2 Zeichen eingeben.</p></div>\";return;}"
+            "rc.innerHTML=\"<div class='card'><p class='status'><span class='spinner'></span>Suche&hellip;</p></div>\";"
+            "fetch('/search?frag=1&q='+encodeURIComponent(q)).then(function(r){return r.text()}).then(function(t){rc.innerHTML=t;})"
+            ".catch(function(){rc.innerHTML=\"<div class='card'><p class='status'>Fehler bei der Suche.</p></div>\";});});}"
             "</script>";
     html += "</body></html>";
     logf("[root] html built: %lums  size: %u bytes\n", millis()-t0, html.length());
@@ -1370,7 +1442,16 @@ void handleRoot() {
 void handleSearch() {
     LOG_REQ();
     String query = server.arg("q");
+    bool frag = server.hasArg("frag");  // AJAX: return only the result card, no page chrome
+    auto finish = [&](const String& inner) {
+        if (frag) { sendHtml(inner); return; }
+        String h = FPSTR(HTML_HEAD);
+        h += inner;
+        h += "</body></html>";
+        sendHtml(h);
+    };
     if (query.length() < 2) {
+        if (frag) { sendHtml(String("<div class='card'><p class='status'>Mindestens 2 Zeichen eingeben.</p></div>")); return; }
         server.sendHeader("Location", "/");
         server.send(302);
         return;
@@ -1381,11 +1462,11 @@ void handleSearch() {
     logf("[search] q='%s' csv scan: %lums, stations: %d\n", query.c_str(), millis()-t0, stations.size());
 
     if (stations.empty()) {
-        String html = FPSTR(HTML_HEAD);
-        html += "<div class='card'><p class='status'>Keine Station gefunden für:<br><b style='color:#e8e8f0'>" + query + "</b></p>";
-        html += "<p class='hint' style='text-align:center'>Tipp: Versuche einen kürzeren Suchbegriff oder <a href='/browse' style='color:#ffbf00'>blättere durch alle Stationen</a>.</p>";
-        html += "<a href='/'><button>Zurück</button></a></div></body></html>";
-        sendHtml(html);
+        String inner = "<div class='card'><p class='status'>Keine Station gefunden für:<br><b style='color:#e8e8f0'>" + query + "</b></p>";
+        inner += "<p class='hint' style='text-align:center'>Tipp: Versuche einen kürzeren Suchbegriff oder <a href='/browse' style='color:#ffbf00'>blättere durch alle Stationen</a>.</p>";
+        if (!frag) inner += "<a href='/'><button>Zurück</button></a>";
+        inner += "</div>";
+        finish(inner);
         return;
     }
 
@@ -1472,7 +1553,7 @@ void handleSearch() {
         return a.lineName < b.lineName;
     });
 
-    String html = FPSTR(HTML_HEAD);
+    String html = "";
     html += "<div class='card'><h2>Ergebnisse: " + query + "</h2>";
 
     if (lineDirMap.empty()) {
@@ -1495,7 +1576,7 @@ void handleSearch() {
             html += "<input type='checkbox' name='line' value='" + val + "'";
             if (alreadyActive) html += " checked disabled";
             html += ">";
-            html += "<span class='" + badgeClassForType(sr.type) + "'>" + sr.lineName + "</span>";
+            html += "<span class='" + badgeClassForType(sr.type) + "'" + badgeColorStyle(sr.lineName, sr.type) + ">" + sr.lineName + "</span>";
             html += "<div class='dir'>" + sr.towards + "</div>";
             html += "</div>";
         }
@@ -1514,7 +1595,7 @@ void handleSearch() {
             String val = sr.rbl + "|" + sr.lineName + "|" + sr.towards + "|" + sr.type;
             html += "<div class='line-item'>";
             html += "<input type='checkbox' name='line' value='" + val + "'>";
-            html += "<span class='" + badgeClassForType(sr.type) + "'>" + sr.lineName + "</span>";
+            html += "<span class='" + badgeClassForType(sr.type) + "'" + badgeColorStyle(sr.lineName, sr.type) + ">" + sr.lineName + "</span>";
             html += "<div class='dir'>" + sr.towards + "</div>";
             html += "</div>";
         }
@@ -1527,8 +1608,9 @@ void handleSearch() {
         html += "</div>";
     }
 
-    html += "<br><a href='/'><button>Zur&uuml;ck</button></a></div></body></html>";
-    sendHtml(html);
+    if (!frag) html += "<br><a href='/'><button>Zur&uuml;ck</button></a>";
+    html += "</div>";
+    finish(html);
 }
 
 void handleSave() {
@@ -1606,6 +1688,44 @@ void handleSetWalk() {
     saveConfig();
     configChanged = true;
     server.send(204);
+}
+
+// POST /move-line — body: idx=N, dir=-1|1 — swap a WL line up/down in cfgLines
+void handleMoveLine() {
+    int idx = server.arg("idx").toInt();
+    int dir = server.arg("dir").toInt();
+    int j   = idx + (dir < 0 ? -1 : 1);
+    if (idx < 0 || idx >= (int)cfgLines.size() || j < 0 || j >= (int)cfgLines.size()) {
+        server.send(400, "text/plain", "bad move");
+        return;
+    }
+    std::swap(cfgLines[idx], cfgLines[j]);
+    saveConfig();
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    departures.clear();
+    displaySlots.clear();
+    xSemaphoreGive(dataMutex);
+    configChanged = true;
+    server.send(204);
+}
+
+// GET /api/now — read-only snapshot of what is currently shown on the display
+void handleApiNow() {
+    JsonDocument doc;
+    JsonArray arr = doc["slots"].to<JsonArray>();
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    for (const Departure& d : displaySlots) {
+        JsonObject o = arr.add<JsonObject>();
+        o["line"] = d.lineName;
+        o["to"]   = d.towards;
+        o["cd"]   = d.countdown;
+        o["walk"] = d.walkMin;
+    }
+    doc["err"] = fetchError;
+    xSemaphoreGive(dataMutex);
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
 }
 
 // Forward declarations
@@ -2094,6 +2214,8 @@ void handleSettings() {
     }
     cfgShowNext        = server.hasArg("show_next");
     cfgShowDisruptions = server.hasArg("show_disruptions");
+    cfgShowClock       = server.hasArg("show_clock");
+    cfgLineColors      = server.hasArg("line_colors");
     cfgSortByTime      = server.hasArg("sort_by_time");
     cfgBetaChannel     = server.hasArg("beta_channel");
 
@@ -2866,6 +2988,8 @@ void startConfigServer() {
     server.on("/save", HTTP_POST, handleSave);
     server.on("/remove", HTTP_POST, handleRemove);
     server.on("/set-walk", HTTP_POST, handleSetWalk);
+    server.on("/move-line", HTTP_POST, handleMoveLine);
+    server.on("/api/now", HTTP_GET, handleApiNow);
     server.on("/settings", HTTP_GET, handleSettingsPage);
     server.on("/settings", HTTP_POST, handleSettings);
     server.on("/oebb-search", handleOebbSearch);
@@ -3428,17 +3552,35 @@ static int tickerOffset = 0;  // disruption ticker horizontal scroll
 // Page rotation for cycling through groups
 static unsigned long lastRotateMs = 0;
 static int pageOffset = 0;
+static int dispPage   = 0;   // current page in the rotation cycle (departure pages + optional clock page)
 // ROTATE_INTERVAL is now dynamic via cfgRotateSec
 
 // Helper: draw glow behind text (1px amber halo for LED bleed)
-void drawGlowText(TFT_eSprite& spr, int x, int y, const String& text) {
-    spr.setTextColor(AMBER_DIM, BG_COLOR);
+void drawGlowText(TFT_eSprite& spr, int x, int y, const String& text, uint16_t core, uint16_t glow) {
+    spr.setTextColor(glow, BG_COLOR);
     spr.setCursor(x - 1, y); spr.print(text);
     spr.setCursor(x + 1, y); spr.print(text);
     spr.setCursor(x, y - 1); spr.print(text);
     spr.setCursor(x, y + 1); spr.print(text);
-    spr.setTextColor(AMBER, BG_COLOR);
+    spr.setTextColor(core, BG_COLOR);
     spr.setCursor(x, y); spr.print(text);
+}
+
+void drawGlowText(TFT_eSprite& spr, int x, int y, const String& text) {
+    drawGlowText(spr, x, y, text, AMBER, AMBER_DIM);
+}
+
+// Display tint for a U-Bahn line name when cfgLineColors is on; AMBER otherwise.
+// `glowOut` receives a dimmed halo matching the core. Trams/buses stay amber.
+uint16_t lineColor565(const String& name, uint16_t& glowOut) {
+    glowOut = AMBER_DIM;
+    if (!cfgLineColors || name.length() < 2 || name[0] != 'U') return AMBER;
+    if (name == "U1") { glowOut = tft.color565(90, 5, 5);  return tft.color565(226, 6, 19);  }
+    if (name == "U2") { glowOut = tft.color565(45, 20, 45); return tft.color565(156, 79, 159); }
+    if (name == "U3") { glowOut = tft.color565(70, 35, 0);  return tft.color565(239, 124, 0); }
+    if (name == "U4") { glowOut = tft.color565(0, 50, 22);  return tft.color565(0, 166, 79);  }
+    if (name == "U6") { glowOut = tft.color565(45, 30, 12); return tft.color565(156, 107, 48); }
+    return AMBER;
 }
 
 // ── Pong: physics tick ───────────────────────────────────────────────
@@ -4069,6 +4211,27 @@ void drawSnakeScene() {
     }
 }
 
+// Big clock page (drawn into the global sprite, which the caller pushes).
+void drawClockScreen(const struct tm& ti) {
+    char hhmm[6];
+    snprintf(hhmm, sizeof(hhmm), "%02d:%02d", ti.tm_hour, ti.tm_min);
+    sprite.setTextFont(1);
+    sprite.setTextColor(AMBER, BG_COLOR);
+    sprite.setTextSize(7);
+    int w = sprite.textWidth(hhmm);
+    drawGlowText(sprite, (SCREEN_W - w) / 2, 35, hhmm);
+
+    static const char* wd[7] = {"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"};
+    char datestr[24];
+    snprintf(datestr, sizeof(datestr), "%s %02d.%02d.%04d",
+             wd[ti.tm_wday % 7], ti.tm_mday, ti.tm_mon + 1, ti.tm_year + 1900);
+    sprite.setTextSize(2);
+    sprite.setTextColor(AMBER_DIM, BG_COLOR);
+    int dw = sprite.textWidth(datestr);
+    sprite.setCursor((SCREEN_W - dw) / 2, 120);
+    sprite.print(datestr);
+}
+
 void drawDisplay() {
     sprite.createSprite(SCREEN_W, SCREEN_H);
     sprite.fillSprite(BG_COLOR);
@@ -4244,12 +4407,18 @@ void drawDisplay() {
             sprite.print(ip);
         }
     } else {
-        // ── Smart display with page rotation ──
-        // Cycle pages when more slots than rows
-        if (totalSlots > MAX_ROWS) {
+        // ── Smart display with page rotation (departure pages + optional clock page) ──
+        int numDepPages = (totalSlots + MAX_ROWS - 1) / MAX_ROWS;
+        if (numDepPages < 1) numDepPages = 1;
+
+        struct tm clockTi;
+        bool clockReady = cfgShowClock && getLocalTime(&clockTi, 0);
+        int totalPages = numDepPages + (clockReady ? 1 : 0);
+
+        if (totalPages > 1) {
             if (millis() - lastRotateMs > (unsigned long)cfgRotateSec * 1000) {
-                pageOffset += MAX_ROWS;
-                if (pageOffset >= totalSlots) pageOffset = 0;
+                dispPage++;
+                if (dispPage >= totalPages) dispPage = 0;
                 lastRotateMs = millis();
                 // Reset scroll for new page
                 for (int j = 0; j < MAX_ROWS; j++) {
@@ -4258,8 +4427,21 @@ void drawDisplay() {
                 }
             }
         } else {
-            pageOffset = 0;
+            dispPage = 0;
         }
+        if (dispPage >= totalPages) dispPage = 0;  // config may have changed since last frame
+
+        // Clock page: draw and bail (no departure slots involved)
+        if (clockReady && dispPage == numDepPages) {
+            drawClockScreen(clockTi);
+            xSemaphoreGive(dataMutex);
+            sprite.pushSprite(0, 0);
+            sprite.deleteSprite();
+            return;
+        }
+
+        pageOffset = dispPage * MAX_ROWS;
+        if (pageOffset >= totalSlots) pageOffset = 0;
 
         // Reserve bottom strip for disruption ticker if active
         bool showTicker = cfgShowDisruptions && !disruptions.empty();
@@ -4317,7 +4499,11 @@ void drawDisplay() {
 
             // ── Line name (huge, left, with glow) ──
             sprite.setTextSize(NAME_SZ);
-            drawGlowText(sprite, PX_MARGIN, centerY - nameH / 2, d.lineName);
+            {
+                uint16_t nameGlow;
+                uint16_t nameCore = lineColor565(d.lineName, nameGlow);
+                drawGlowText(sprite, PX_MARGIN, centerY - nameH / 2, d.lineName, nameCore, nameGlow);
+            }
 
             // ── Direction (always clipped to center column) ──
             sprite.setTextSize(DIR_SZ);
